@@ -121,7 +121,9 @@ def provider_failure_cooldown_seconds() -> float:
 # Read at call time so .env / test overrides always apply.
 #
 
-TRADING_MODE = os.getenv("TRADING_MODE", "paper")
+def trading_mode() -> str:
+    """Only 'paper' exists in this codebase. Read at call time."""
+    return (os.getenv("TRADING_MODE") or "paper").strip().lower()
 
 RISK_DEFAULTS = {
     "MAX_PREMIUM_PER_TRADE": 500.0,

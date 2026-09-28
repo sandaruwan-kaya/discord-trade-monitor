@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now_iso():
@@ -92,6 +92,9 @@ def migrate(conn):
 
     if version < 2:
         _migrate_v2(conn)
+
+    if version < 3:
+        _migrate_v3(conn)
 
 
 def _migrate_v1(conn):
@@ -226,6 +229,97 @@ def _migrate_v2(conn):
         )
 
         conn.execute("PRAGMA user_version = 2")
+
+
+def _migrate_v3(conn):
+    """
+    Paper broker state. CHECK constraints make illegal states
+    unrepresentable: only BUY_TO_OPEN / SELL_TO_CLOSE, positive order
+    quantities, no negative (short) position quantities. UNIQUE keys
+    give idempotency (client_order_id), one fill per order (no partial
+    fills in V1) and one position per filled entry order.
+    """
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                order_id TEXT PRIMARY KEY,
+                client_order_id TEXT NOT NULL UNIQUE,
+                signal_id INTEGER,
+                proposal_key TEXT,
+                position_id TEXT,
+                contract_symbol TEXT NOT NULL,
+                side TEXT NOT NULL
+                    CHECK (side IN ('BUY_TO_OPEN', 'SELL_TO_CLOSE')),
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                limit_price REAL NOT NULL CHECK (limit_price > 0),
+                status TEXT NOT NULL
+                    CHECK (status IN ('PENDING', 'FILLED', 'CANCELLED', 'REJECTED')),
+                fill_price REAL,
+                rejection_reason TEXT,
+                last_quote_bid REAL,
+                last_quote_ask REAL,
+                last_checked_at TEXT,
+                submitted_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                filled_at TEXT,
+                cancelled_at TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_fills (
+                fill_id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL UNIQUE REFERENCES paper_orders(order_id),
+                contract_symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                price REAL NOT NULL CHECK (price > 0),
+                quote_bid REAL,
+                quote_ask REAL,
+                filled_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                position_id TEXT PRIMARY KEY,
+                entry_order_id TEXT NOT NULL UNIQUE REFERENCES paper_orders(order_id),
+                signal_id INTEGER,
+                proposal_key TEXT,
+                contract_symbol TEXT NOT NULL,
+                underlying TEXT,
+                option_type TEXT,
+                contract_multiplier REAL NOT NULL CHECK (contract_multiplier > 0),
+                quantity INTEGER NOT NULL CHECK (quantity >= 0),
+                original_quantity INTEGER NOT NULL CHECK (original_quantity > 0),
+                entry_price REAL NOT NULL CHECK (entry_price > 0),
+                current_mark REAL,
+                mark_as_of TEXT,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED')),
+                opened_at TEXT NOT NULL,
+                closed_at TEXT,
+                updated_at TEXT NOT NULL,
+                CHECK (status = 'CLOSED' OR quantity > 0)
+            )
+            """
+        )
+
+        for sql in (
+            "CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status)",
+            "CREATE INDEX IF NOT EXISTS idx_paper_orders_signal ON paper_orders(signal_id)",
+            "CREATE INDEX IF NOT EXISTS idx_paper_positions_status ON paper_positions(status)",
+            "CREATE INDEX IF NOT EXISTS idx_paper_positions_signal ON paper_positions(signal_id)",
+        ):
+            conn.execute(sql)
+
+        conn.execute("PRAGMA user_version = 3")
 
 
 def save_signal(

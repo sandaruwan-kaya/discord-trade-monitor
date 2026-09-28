@@ -103,7 +103,8 @@ def test_update_status_sets_first_working_at_once():
 def test_db_path_is_absolute_and_project_relative(monkeypatch):
     import config
 
-    monkeypatch.delenv("TRADE_MONITOR_DB")
-    path = config.db_path()
+    with monkeypatch.context() as m:
+        m.delenv("TRADE_MONITOR_DB")
+        path = config.db_path()
     assert path == str(config.PROJECT_DIR / "trade_monitor.db")
     assert path.startswith("/")

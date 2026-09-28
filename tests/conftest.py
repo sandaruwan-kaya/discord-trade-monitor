@@ -46,7 +46,12 @@ def temp_db(tmp_path, monkeypatch):
     path = tmp_path / "test.db"
     monkeypatch.setenv("TRADE_MONITOR_DB", str(path))
 
+    import config
     import database
     database.initialize_database()
 
-    return path
+    yield path
+
+    # A test that undid the DB override would have pointed at the real file.
+    assert config.db_path() != str(config.PROJECT_DIR / "trade_monitor.db"), \
+        "test ended pointing at the real project database"

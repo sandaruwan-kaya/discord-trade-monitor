@@ -348,3 +348,109 @@ class OptionProposal(BaseModel):
             raise ValueError("limit price must be > 0 and <= ask for a buy")
 
         return self
+
+
+#
+# Broker (venue-neutral names; V1 implementation is paper only)
+#
+
+OrderSide = Literal["BUY_TO_OPEN", "SELL_TO_CLOSE"]   # no SELL_TO_OPEN: naked selling is unrepresentable
+
+OrderStatus = Literal["PENDING", "FILLED", "CANCELLED", "REJECTED"]
+
+PositionStatus = Literal["OPEN", "CLOSED"]
+
+
+class OrderRequest(BaseModel):
+    """
+    What a caller asks the broker to do. client_order_id is the
+    idempotency key: resubmitting the same key never creates a second order.
+    SELL_TO_CLOSE must reference the open position it closes.
+    """
+    client_order_id: str
+    signal_id: Optional[int] = None
+    proposal_key: Optional[str] = None
+    position_id: Optional[str] = None
+    contract_symbol: str
+    side: OrderSide
+    quantity: int
+    limit_price: float
+
+    @model_validator(mode="after")
+    def _valid(self):
+        if not self.client_order_id.strip():
+            raise ValueError("client_order_id is required")
+        if self.quantity < 1:
+            raise ValueError("quantity must be >= 1")
+        if self.limit_price <= 0:
+            raise ValueError("limit_price must be > 0")
+        if self.side == "SELL_TO_CLOSE" and not self.position_id:
+            raise ValueError("SELL_TO_CLOSE requires position_id")
+        if self.side == "BUY_TO_OPEN" and self.position_id:
+            raise ValueError("BUY_TO_OPEN cannot reference a position")
+        return self
+
+
+class PaperOrder(BaseModel):
+    order_id: str
+    client_order_id: str
+    signal_id: Optional[int] = None
+    proposal_key: Optional[str] = None
+    position_id: Optional[str] = None
+    contract_symbol: str
+    side: OrderSide
+    quantity: int
+    limit_price: float
+    status: OrderStatus
+    fill_price: Optional[float] = None
+    rejection_reason: Optional[str] = None
+    last_quote_bid: Optional[float] = None
+    last_quote_ask: Optional[float] = None
+    last_checked_at: Optional[str] = None
+    submitted_at: str
+    updated_at: str
+    filled_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
+
+
+class PaperFill(BaseModel):
+    fill_id: str
+    order_id: str
+    contract_symbol: str
+    side: OrderSide
+    quantity: int
+    price: float
+    quote_bid: Optional[float] = None
+    quote_ask: Optional[float] = None
+    filled_at: str
+
+
+class PaperPosition(BaseModel):
+    position_id: str
+    entry_order_id: str
+    signal_id: Optional[int] = None
+    proposal_key: Optional[str] = None
+    contract_symbol: str
+    underlying: Optional[str] = None
+    option_type: Optional[OptionType] = None
+    contract_multiplier: float
+    quantity: int                      # open quantity; never negative
+    original_quantity: int
+    entry_price: float
+    current_mark: Optional[float] = None
+    mark_as_of: Optional[str] = None
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    status: PositionStatus
+    opened_at: str
+    closed_at: Optional[str] = None
+    updated_at: str
+
+
+class BrokerOrderResult(BaseModel):
+    ok: bool
+    order: Optional[PaperOrder] = None
+    fill: Optional[PaperFill] = None
+    position: Optional[PaperPosition] = None
+    idempotent_replay: bool = False
+    message: str = ""
