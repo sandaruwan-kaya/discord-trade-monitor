@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 import config
 import database
 from broker.base import BrokerBase
-from core import policy_engine
+from core import lifecycle_sync, policy_engine
 from schemas import ExecutionResult, OptionProposal, OrderRequest
 
 
@@ -57,6 +57,23 @@ BROKER_TO_EXECUTION = {
 
 def entry_execution_key(proposal_key: str) -> str:
     return f"entry:{proposal_key}"
+
+
+# EXIT canonical identity: one full close per POSITION (Agent 4 guarantees a
+# single full-exit request per position, exit:{position_id}:full).
+def exit_execution_key(position_id: str) -> str:
+    return f"exit:{position_id}:full"
+
+
+def close_client_order_id(position_id: str) -> str:
+    return f"close:{position_id}:full"
+
+
+# Exit states from which a later call may continue. Safe because every
+# resumption first looks the close order up by its stable client_order_id,
+# and the broker de-duplicates on it: a second close order cannot exist.
+EXIT_RESUMABLE = {"WAITING_FOR_QUOTE", "INTERRUPTED", "FAILED"}
+EXIT_FINAL = {"ORDER_FILLED", "POLICY_REJECTED", "ORDER_REJECTED", "ORDER_CANCELLED"}
 
 
 class ExecutionService:
@@ -164,6 +181,8 @@ class ExecutionService:
             ok=a["status"] in ("ORDER_PENDING", "ORDER_FILLED"),
             status=a["status"],
             proposal_key=a["proposal_key"],
+            purpose=a["purpose"],
+            exit_request_id=a.get("exit_request_id"),
             execution_id=a["execution_id"],
             execution_key=a["execution_key"],
             replay=replay,
@@ -338,6 +357,9 @@ class ExecutionService:
         if attempt is None:
             return None
 
+        if attempt["purpose"] == "EXIT":
+            return self._reconcile_exit_attempt(attempt, process_pending)
+
         status = attempt["status"]
 
         if status in IN_FLIGHT:
@@ -373,12 +395,235 @@ class ExecutionService:
         try:
             keys = [r[0] for r in conn.execute(
                 "SELECT execution_key FROM execution_attempts "
-                "WHERE status IN ('ORDER_PENDING', 'CLAIMED', 'SUBMITTING') ORDER BY created_at"
+                "WHERE status IN ('ORDER_PENDING', 'CLAIMED', 'SUBMITTING') "
+                "   OR (purpose = 'EXIT' AND status IN ('WAITING_FOR_QUOTE', 'INTERRUPTED', 'FAILED')) "
+                "ORDER BY created_at"
             )]
         finally:
             conn.close()
 
         return [self.reconcile_execution(k, process_pending=False) for k in keys]
+
+
+    #
+    # EXIT execution (full exits only; paper only; no LLM)
+    #
+
+    def _exit_request(self, exit_request_id):
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM exit_requests WHERE exit_request_id = ?", (exit_request_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def _position(self, position_id):
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM paper_positions WHERE position_id = ?", (position_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def _stale(self, attempt):
+        age = (self._now_ms() - _iso_to_ms(attempt["updated_at"])) / 1000
+        return age >= config.execution_claim_timeout_seconds()
+
+    def execute_exit(self, exit_request_id: str) -> ExecutionResult:
+        """
+        Execute a persisted full EXIT request: fresh exit policy -> one
+        SELL_TO_CLOSE at the fresh BID for the full open quantity.
+        """
+        xr = self._exit_request(exit_request_id)
+        if xr is None:
+            return ExecutionResult(ok=False, status="REFUSED", purpose="EXIT", exit_request_id=exit_request_id,
+                                   persisted=False, error_code="EXIT_REQUEST_NOT_FOUND")
+        if xr["requested_action"] != "EXIT":
+            return ExecutionResult(ok=False, status="NOT_EXECUTABLE_V1", purpose="EXIT",
+                                   exit_request_id=exit_request_id, persisted=False,
+                                   error_code="REDUCE_NOT_EXECUTABLE_V1",
+                                   message="REDUCE requests are advisory in V1; no order created")
+
+        position_id = xr["position_id"]
+        key = exit_execution_key(position_id)
+        coid = close_client_order_id(position_id)
+        attempt = self.get_attempt(key)
+
+        if xr["status"] != "ACTIVE":
+            if attempt:
+                return self._result(key, replay=True, message=f"exit request is {xr['status']}")
+            return ExecutionResult(ok=False, status="REFUSED", purpose="EXIT", exit_request_id=exit_request_id,
+                                   persisted=False, error_code="EXIT_REQUEST_NOT_ACTIVE",
+                                   message=f"exit request is {xr['status']}; nothing to execute")
+
+        if attempt is not None:
+            status = attempt["status"]
+            if status in ("SUBMITTING", "ORDER_PENDING") or (status == "CLAIMED" and not self._stale(attempt)):
+                return self._reconcile_exit_attempt(attempt, process_pending=False)
+            if status in EXIT_FINAL:
+                self._sync_exit_lifecycle(key)
+                return self._result(key, replay=True)
+            # Resumable (WAITING_FOR_QUOTE / INTERRUPTED / FAILED / stale CLAIMED):
+            # never submit before checking the broker by stable id.
+            order = self.broker.get_order_by_client_id(coid)
+            if order is not None:
+                return self._apply_exit_order(key, {status}, order, "reconciled by client_order_id")
+            position = self._position(position_id)
+            if position is not None and position["status"] == "CLOSED":
+                lifecycle_sync.reconcile_already_closed(xr["trade_id"], exit_request_id, self._now_iso())
+                return self._result(key, message="position closed elsewhere; lifecycle reconciled")
+            if not self._transition(key, {status}, "CLAIMED"):
+                return self._result(key, replay=True, message="another caller resumed this exit")
+            return self._run_exit(key, xr, coid)
+
+        position = self._position(position_id)
+        if position is not None and position["status"] == "CLOSED":
+            lifecycle_sync.reconcile_already_closed(xr["trade_id"], exit_request_id, self._now_iso())
+            return ExecutionResult(ok=True, status="ALREADY_CLOSED", purpose="EXIT", exit_request_id=exit_request_id,
+                                   persisted=False, message="position already closed; lifecycle reconciled, no order")
+
+        trade = None
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT proposal_key, signal_id FROM trades WHERE trade_id = ?", (xr["trade_id"],)).fetchone()
+            trade = dict(row) if row else None
+        finally:
+            conn.close()
+
+        now = self._now_iso()
+        with self._txn() as conn:
+            claimed = conn.execute(
+                """
+                INSERT OR IGNORE INTO execution_attempts (
+                    execution_id, execution_key, proposal_key, signal_id, purpose, status,
+                    client_order_id, created_at, updated_at, input_json, exit_request_id
+                )
+                VALUES (?, ?, ?, ?, 'EXIT', 'CLAIMED', ?, ?, ?, ?, ?)
+                """,
+                (f"EX-{uuid.uuid4().hex[:16]}", key,
+                 (trade or {}).get("proposal_key") or xr["request_key"], (trade or {}).get("signal_id"),
+                 coid, now, now, json.dumps({"exit_request": xr}, default=str), exit_request_id)
+            ).rowcount == 1
+            if claimed:
+                execution_id = conn.execute(
+                    "SELECT execution_id FROM execution_attempts WHERE execution_key = ?", (key,)
+                ).fetchone()[0]
+                self._event(conn, execution_id, None, "CLAIMED", {"exit_request_id": exit_request_id}, now)
+
+        if not claimed:
+            return self._result(key, replay=True, message="exit execution already exists for this position")
+
+        return self._run_exit(key, xr, coid)
+
+    def _run_exit(self, key, xr, coid) -> ExecutionResult:
+        attempt = self.get_attempt(key)
+        try:
+            inp = policy_engine.gather_exit_input(xr["exit_request_id"], self.chain_provider, self._now_ms(), coid)
+            decision = policy_engine.persist_decision(policy_engine.evaluate_exit(inp), inp)
+
+            if not decision.approved:
+                status = "WAITING_FOR_QUOTE" if decision.retryable else "POLICY_REJECTED"
+                self._transition(
+                    key, {"CLAIMED"}, status,
+                    policy_decision_id=decision.decision_id,
+                    error_code="EXIT_BLOCKED_DATA" if decision.retryable else "EXIT_POLICY_REJECTED",
+                    error_message=",".join(decision.reasons),
+                    result_json=json.dumps({"policy_reasons": decision.reasons}),
+                )
+                lifecycle_sync.set_exit_request_execution(xr["exit_request_id"], attempt["execution_id"],
+                                                          status, self._now_iso())
+                return self._result(key)
+
+            if not self._transition(
+                key, {"CLAIMED"}, "SUBMITTING", policy_decision_id=decision.decision_id,
+                result_json=json.dumps({"policy_reasons": [], "close": {
+                    "position_id": xr["position_id"], "limit_price": decision.exit_limit_price,
+                    "quantity": decision.exit_quantity, "client_order_id": coid}}),
+            ):
+                return self._result(key)
+            lifecycle_sync.set_exit_request_execution(xr["exit_request_id"], attempt["execution_id"],
+                                                      "SUBMITTING", self._now_iso())
+
+            try:
+                broker_result = self.broker.close_position(
+                    xr["position_id"],
+                    limit_price=decision.exit_limit_price,     # the fresh BID, never mark/mid/ask
+                    client_order_id=coid,
+                    quantity=decision.exit_quantity,           # full open quantity, revalidated
+                )
+            except Exception as error:
+                self._log(f"[EXEC] {key}: broker error {type(error).__name__}; reconciling by client_order_id")
+                return self._reconcile_exit_attempt(self.get_attempt(key), process_pending=False, force=True,
+                                                    broker_error=error)
+
+            return self._apply_exit_order(key, {"SUBMITTING"}, broker_result.order, broker_result.message)
+
+        except Exception as error:
+            self._log(f"[EXEC] {key}: {type(error).__name__}: {str(error)[:200]}")
+            current = self.get_attempt(key)
+            if current and current["status"] == "SUBMITTING":
+                return self._reconcile_exit_attempt(current, process_pending=False, force=True)
+            self._transition(key, {"CLAIMED"}, "FAILED", error_code="INTERNAL_ERROR",
+                             error_message=f"{type(error).__name__}: {str(error)[:300]} (exit resumable)")
+            return self._result(key)
+
+    def _apply_exit_order(self, key, expected, order, message=""):
+        result = self._apply_broker_order(key, expected, order, message)
+        self._sync_exit_lifecycle(key)
+        return self._result(key, message=result.message)
+
+    def _sync_exit_lifecycle(self, key):
+        a = self.get_attempt(key)
+        if a is None or not a["broker_order_id"]:
+            return
+        order = self.broker.get_order(a["broker_order_id"])
+        xr = self._exit_request(a["exit_request_id"])
+        position = self._position(xr["position_id"]) if xr else None
+        if order is None or xr is None:
+            return
+        if order.status in ("PENDING", "FILLED"):
+            lifecycle_sync.sync_after_close(xr["trade_id"], xr["exit_request_id"], a["execution_id"], order.order_id,
+                                            order.status, position["status"] if position else None, self._now_iso())
+        else:
+            lifecycle_sync.set_exit_request_execution(xr["exit_request_id"], a["execution_id"],
+                                                      a["status"], self._now_iso())
+
+    def _reconcile_exit_attempt(self, attempt, process_pending=False, force=False, broker_error=None):
+        """Advance an exit execution from broker state. Submits only when resuming a resumable exit."""
+        key, status = attempt["execution_key"], attempt["status"]
+
+        if status in EXIT_RESUMABLE or (status == "CLAIMED" and self._stale(attempt)):
+            return self.execute_exit(attempt["exit_request_id"])
+
+        if status == "SUBMITTING":
+            try:
+                order = self.broker.get_order_by_client_id(attempt["client_order_id"])
+            except Exception as error:
+                self._log(f"[EXEC] {key}: broker lookup failed ({type(error).__name__}); left SUBMITTING")
+                return self._result(key, message="broker unreachable; exit left SUBMITTING")
+            if order is not None:
+                return self._apply_exit_order(key, {"SUBMITTING"}, order, "reconciled by client_order_id")
+            if force or self._stale(attempt):
+                detail = (f"{type(broker_error).__name__}: {str(broker_error)[:200]}" if broker_error
+                          else "no close order exists for client_order_id") + "; exit remains required (resumable)"
+                self._transition(key, {"SUBMITTING"}, "INTERRUPTED", error_code="SUBMIT_UNCONFIRMED",
+                                 error_message=detail)
+                lifecycle_sync.set_exit_request_execution(attempt["exit_request_id"], attempt["execution_id"],
+                                                          "INTERRUPTED", self._now_iso())
+            return self._result(key)
+
+        if status == "ORDER_PENDING":
+            if process_pending:
+                self.broker.process_pending_orders()
+            order = self.broker.get_order(attempt["broker_order_id"])
+            if order is not None and order.status != "PENDING":
+                return self._apply_exit_order(key, {"ORDER_PENDING"}, order, "reconciled")
+            self._sync_exit_lifecycle(key)
+            return self._result(key)
+
+        if status in EXIT_FINAL:
+            self._sync_exit_lifecycle(key)
+        return self._result(key)
 
 
 def _iso_to_ms(value):

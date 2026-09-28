@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def utc_now_iso():
@@ -107,6 +107,9 @@ def migrate(conn):
 
     if version < 7:
         _migrate_v7(conn)
+
+    if version < 8:
+        _migrate_v8(conn)
 
 
 def _migrate_v1(conn):
@@ -381,6 +384,8 @@ EXECUTION_STATUSES = (
     "ORDER_REJECTED", "ORDER_CANCELLED", "FAILED", "INTERRUPTED",
 )
 
+EXECUTION_STATUSES_V8 = EXECUTION_STATUSES + ("WAITING_FOR_QUOTE",)
+
 
 def _migrate_v5(conn):
     """
@@ -573,6 +578,73 @@ def _migrate_v7(conn):
             conn.execute(sql)
 
         conn.execute("PRAGMA user_version = 7")
+
+
+_EXECUTION_COLUMNS_V5 = (
+    "execution_id, execution_key, proposal_key, signal_id, purpose, status, policy_decision_id, "
+    "client_order_id, broker_order_id, error_code, error_message, created_at, updated_at, "
+    "completed_at, input_json, result_json"
+)
+
+
+def _migrate_v8(conn):
+    """
+    Exit execution.
+
+    execution_attempts is REBUILT (SQLite cannot alter a CHECK constraint)
+    to allow WAITING_FOR_QUOTE and to add exit_request_id. Every existing
+    row is copied verbatim. exit_requests gains execution_id /
+    execution_status; its status stays ACTIVE until the position is
+    actually closed, so the one-ACTIVE-full-exit index keeps holding.
+    """
+    statuses = ", ".join(f"'{s}'" for s in EXECUTION_STATUSES_V8)
+
+    with conn:
+        conn.execute(
+            f"""
+            CREATE TABLE execution_attempts_v8 (
+                execution_id TEXT PRIMARY KEY,
+                execution_key TEXT NOT NULL UNIQUE,
+                proposal_key TEXT NOT NULL,
+                signal_id INTEGER,
+                purpose TEXT NOT NULL CHECK (purpose IN ('ENTRY', 'EXIT')),
+                status TEXT NOT NULL CHECK (status IN ({statuses})),
+                policy_decision_id TEXT REFERENCES policy_decisions(decision_id),
+                client_order_id TEXT NOT NULL UNIQUE,
+                broker_order_id TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                input_json TEXT,
+                result_json TEXT,
+                exit_request_id TEXT REFERENCES exit_requests(exit_request_id),
+                CHECK (purpose = 'EXIT' OR status != 'WAITING_FOR_QUOTE'),
+                CHECK ((purpose = 'EXIT') = (exit_request_id IS NOT NULL))
+            )
+            """
+        )
+        conn.execute(
+            f"INSERT INTO execution_attempts_v8 ({_EXECUTION_COLUMNS_V5}) "
+            f"SELECT {_EXECUTION_COLUMNS_V5} FROM execution_attempts"
+        )
+        conn.execute("DROP TABLE execution_attempts")
+        conn.execute("ALTER TABLE execution_attempts_v8 RENAME TO execution_attempts")
+
+        for sql in (
+            "CREATE INDEX IF NOT EXISTS idx_execution_attempts_status ON execution_attempts(status)",
+            "CREATE INDEX IF NOT EXISTS idx_execution_attempts_proposal ON execution_attempts(proposal_key)",
+            "CREATE INDEX IF NOT EXISTS idx_execution_attempts_exit_request ON execution_attempts(exit_request_id)",
+        ):
+            conn.execute(sql)
+
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(exit_requests)")}
+        for name in ("execution_id", "execution_status"):
+            if name not in existing:
+                conn.execute(f"ALTER TABLE exit_requests ADD COLUMN {name} TEXT")
+
+        conn.execute("PRAGMA user_version = 8")
 
 
 def save_signal(

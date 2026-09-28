@@ -37,6 +37,7 @@ TRADE_MONITOR_DB=/tmp/policy_demo.db venv/bin/python scripts/policy_demo.py     
 TRADE_MONITOR_DB=/tmp/execution_demo.db venv/bin/python scripts/execution_demo.py  # scratch DB only
 TRADE_MONITOR_DB=/tmp/risk_demo.db venv/bin/python scripts/risk_demo.py            # scratch DB only, uses OpenAI
 TRADE_MONITOR_DB=/tmp/tm_demo.db venv/bin/python scripts/trade_manager_demo.py     # scratch DB only
+TRADE_MONITOR_DB=/tmp/exit_demo.db venv/bin/python scripts/exit_execution_demo.py  # scratch DB only
 ```
 
 ## Configuration (.env)
@@ -67,3 +68,19 @@ TRADE_MONITOR_DB=/tmp/tm_demo.db venv/bin/python scripts/trade_manager_demo.py  
 | `ALLOWED_UNDERLYINGS` | `BTCUSDT,ETHUSDT` | Underlyings eligible for option proposals |
 | `MAX_PREMIUM_PER_TRADE`, `MAX_CONTRACTS`, `MIN_DTE`, `MAX_DTE`, `MIN_ABS_DELTA`, `MAX_ABS_DELTA`, `MAX_BID_ASK_SPREAD_PCT`, `MIN_OPEN_INTEREST`, `MIN_OPTION_VOLUME`, `MAX_QUOTE_AGE_SECONDS`, `OPTION_FEE_PER_CONTRACT` | `500, 2, 7, 45, 0.35, 0.65, 10, 100, 10, 60, 0` | Paper-trading demo playbook limits |
 | `MOCK_OPTION_{MULTIPLIER,STRIKE_STEP,TICK,BASE_IV,PEAK_OI}_{BTC,ETH}` | BTC `0.01/1000/5/0.50/3000`, ETH `0.1/25/0.5/0.65/5000` | Mock Deribit-style chain |
+
+## Exit execution (paper)
+
+`ExecutionService.execute_exit(exit_request_id)` executes an Agent 4 full-EXIT request:
+
+- Canonical identity: execution key `exit:{position_id}:full`, broker client_order_id `close:{position_id}:full`
+  (one full close per position).
+- Deterministic EXIT policy (`policy_engine.evaluate_exit`): paper mode, active full-exit request, trade in
+  EXIT_REQUESTED/CLOSE_ORDER_PENDING, open position whose quantity still equals the requested quantity, matching
+  contract, no other resting close, usable fresh bid. The kill switch and all entry-risk limits never block an exit.
+- SELL_TO_CLOSE limit = the fresh **bid**, for the full open quantity.
+- Missing/unusable quote -> `WAITING_FOR_QUOTE` (the trade stays EXIT_REQUESTED, the request stays ACTIVE); later
+  calls/reconciliation resume the SAME execution. Structural problems (quantity changed, wrong contract, foreign close
+  order) are final `POLICY_REJECTED` for operator review. REDUCE requests are `NOT_EXECUTABLE_V1`.
+- Lifecycle: EXIT_REQUESTED -> CLOSE_ORDER_PENDING -> CLOSED (both events recorded even on an immediate fill); the
+  exit request becomes COMPLETED only when the broker position is actually closed.

@@ -566,10 +566,14 @@ class PolicyDecision(BaseModel):
     checked_at: str
     proposal_key: str
     signal_id: Optional[int] = None
-    policy_snapshot: PolicySnapshot
+    policy_snapshot: "PolicySnapshot | ExitPolicySnapshot"
     calculated_max_loss: Optional[float] = None
     calculated_total_open_risk: Optional[float] = None
     quote_age_seconds: Optional[float] = None
+    # EXIT decisions
+    retryable: bool = False                 # rejected only for transient data reasons
+    exit_limit_price: Optional[float] = None
+    exit_quantity: Optional[int] = None
 
 
 #
@@ -579,14 +583,19 @@ class PolicyDecision(BaseModel):
 ExecutionStatus = Literal[
     "CLAIMED", "POLICY_REJECTED", "SUBMITTING", "ORDER_PENDING", "ORDER_FILLED",
     "ORDER_REJECTED", "ORDER_CANCELLED", "FAILED", "INTERRUPTED",
-    "REFUSED",          # not persisted: proposal missing / not ready (retryable later)
+    "WAITING_FOR_QUOTE",   # EXIT only: exit required but no usable bid yet (non-final)
+    "REFUSED",             # not persisted: proposal/exit request missing, not ready or not active
+    "NOT_EXECUTABLE_V1",   # not persisted: REDUCE requests are advisory in V1
+    "ALREADY_CLOSED",      # not persisted: position already closed; lifecycle reconciled, no order
 ]
 
 
 class ExecutionResult(BaseModel):
     ok: bool
     status: ExecutionStatus
-    proposal_key: str
+    proposal_key: Optional[str] = None
+    purpose: Literal["ENTRY", "EXIT"] = "ENTRY"
+    exit_request_id: Optional[str] = None
     execution_id: Optional[str] = None
     execution_key: Optional[str] = None
     replay: bool = False
@@ -859,3 +868,74 @@ class ExitRequest(BaseModel):
     created_at: str
     updated_at: str
     completed_at: Optional[str] = None
+
+
+
+#
+# Exit policy (deterministic; "can we safely execute the required exit?")
+#
+
+class ExitRequestState(BaseModel):
+    exit_request_id: str
+    request_key: str
+    trade_id: str
+    position_id: str
+    requested_action: Literal["REDUCE", "EXIT"]
+    requested_quantity: Optional[int]
+    status: str
+    hard_exit: bool
+    data_issue_codes: list[str] = Field(default_factory=list)
+
+
+class TradeStateSummary(BaseModel):
+    trade_id: str
+    state: str
+    position_id: str
+    proposal_key: Optional[str] = None
+    signal_id: Optional[int] = None
+
+
+class ExitPositionState(BaseModel):
+    position_id: str
+    status: str
+    quantity: int
+    contract_symbol: str
+    contract_multiplier: float
+    entry_price: float
+
+
+class CloseOrderState(BaseModel):
+    order_id: str
+    client_order_id: str
+    status: str
+    quantity: int
+    limit_price: float
+
+
+class ExitPolicyLimits(BaseModel):
+    required_trading_mode: Literal["paper"] = "paper"
+    max_quote_age_seconds: float
+
+
+class ExitPolicySnapshot(BaseModel):
+    limits: ExitPolicyLimits
+    trading_mode: str
+    kill_switch: KillSwitchState            # recorded for audit; never blocks an exit
+
+
+class ExitPolicyInput(BaseModel):
+    purpose: Literal["EXIT"] = "EXIT"
+    exit_request: ExitRequestState
+    trade: Optional[TradeStateSummary]
+    position: Optional[ExitPositionState]
+    quote: Optional[OptionContract]
+    quote_error: Optional[str] = None
+    close_client_order_id: str
+    pending_close_orders: list[CloseOrderState]   # PENDING SELL_TO_CLOSE orders on this position
+    now_ms: int
+    limits: ExitPolicyLimits
+    trading_mode: str
+    kill_switch: KillSwitchState
+
+
+PolicyDecision.model_rebuild()

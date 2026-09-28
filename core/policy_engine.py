@@ -518,3 +518,166 @@ def evaluate_entry(proposal: OptionProposal, chain_provider, market, now_ms) -> 
     """gather -> evaluate -> persist. Authorizes only; never submits anything."""
     inp = gather_entry_input(proposal, chain_provider, market, now_ms)
     return persist_decision(evaluate(inp), inp)
+
+
+#
+# EXIT policy — "can we safely execute the already-required risk reduction?"
+#
+# Deliberately NOT applied to exits: kill switch, max daily loss, max open
+# positions, max premium, chase protection, target progress, entry strategy
+# limits. A halted system must still be able to close risk.
+#
+# Reasons are split into:
+#   structural (final for this execution): the exit as requested is not valid
+#   transient  (retryable):                 the exit is valid, the data is not
+#
+
+EXIT_TRANSIENT_REASONS = frozenset({
+    "quote_unavailable", "no_valid_bid", "quote_stale", "quote_terms_changed",
+})
+
+
+def current_exit_limits():
+    from schemas import ExitPolicyLimits
+    return ExitPolicyLimits(max_quote_age_seconds=config.risk("MAX_QUOTE_AGE_SECONDS"))
+
+
+def evaluate_exit(inp) -> PolicyDecision:
+    """Pure. ExitPolicyInput -> PolicyDecision (purpose EXIT)."""
+    from schemas import ExitPolicySnapshot
+
+    reasons: list[str] = []
+
+    def reject(code):
+        if code not in reasons:
+            reasons.append(code)
+
+    xr, trade, pos, q = inp.exit_request, inp.trade, inp.position, inp.quote
+
+    if inp.trading_mode != "paper":
+        reject("trading_mode_not_paper")
+
+    # The exit requirement itself
+    if xr.status != "ACTIVE":
+        reject("exit_request_not_active")
+    if xr.requested_action != "EXIT":
+        reject("not_a_full_exit")
+    if trade is None:
+        reject("trade_missing")
+    else:
+        if trade.position_id != xr.position_id:
+            reject("trade_position_mismatch")
+        if trade.state not in ("EXIT_REQUESTED", "CLOSE_ORDER_PENDING"):
+            reject("trade_not_exit_requested")
+
+    # The position to close
+    quantity = None
+    if pos is None:
+        reject("position_missing")
+    else:
+        if pos.position_id != xr.position_id:
+            reject("position_mismatch")
+        if pos.status != "OPEN":
+            reject("position_not_open")
+        if pos.quantity <= 0:
+            reject("position_quantity_zero")
+        elif xr.requested_quantity is not None and pos.quantity != xr.requested_quantity:
+            reject("position_quantity_changed")
+        else:
+            quantity = pos.quantity
+
+    # No other close already representing this exit
+    if any(o.client_order_id != inp.close_client_order_id for o in inp.pending_close_orders):
+        reject("close_order_already_exists")
+
+    # Fresh quote (transient problems only)
+    limit_price, quote_age = None, None
+    if q is None:
+        reject("quote_unavailable")
+    else:
+        if pos is not None and q.contract_symbol != pos.contract_symbol:
+            reject("contract_mismatch")
+        if pos is not None and q.contract_multiplier != pos.contract_multiplier:
+            reject("quote_terms_changed")
+        if q.bid is None or q.bid <= 0 or (q.ask is not None and q.ask < q.bid):
+            reject("no_valid_bid")
+        quote_age = max(0.0, (inp.now_ms - q.as_of_ms) / 1000)
+        if _gt(quote_age, inp.limits.max_quote_age_seconds):
+            reject("quote_stale")
+        if q.bid is not None and q.bid > 0:
+            limit_price = q.bid                        # deterministic: SELL_TO_CLOSE at the fresh BID
+
+    key = evaluation_key(inp)
+    approved = not reasons
+
+    return PolicyDecision(
+        decision_id=f"PD-{key[:20]}",
+        evaluation_key=key,
+        purpose="EXIT",
+        approved=approved,
+        decision="APPROVED" if approved else "REJECTED",
+        reasons=reasons,
+        checked_at=_iso(inp.now_ms),
+        proposal_key=(trade.proposal_key if trade and trade.proposal_key else xr.request_key),
+        signal_id=trade.signal_id if trade else None,
+        policy_snapshot=ExitPolicySnapshot(limits=inp.limits, trading_mode=inp.trading_mode,
+                                           kill_switch=inp.kill_switch),
+        quote_age_seconds=quote_age,
+        retryable=bool(reasons) and set(reasons) <= EXIT_TRANSIENT_REASONS,
+        exit_limit_price=limit_price if approved else None,
+        exit_quantity=quantity if approved else None,
+    )
+
+
+def gather_exit_input(exit_request_id, chain_provider, now_ms, close_client_order_id):
+    """Read-only snapshot for the EXIT policy (no broker object)."""
+    from schemas import (
+        CloseOrderState,
+        ExitPolicyInput,
+        ExitPositionState,
+        ExitRequestState,
+        TradeStateSummary,
+    )
+
+    with closing(database.get_connection()) as conn:
+        conn.row_factory = sqlite3.Row
+        xr = conn.execute("SELECT * FROM exit_requests WHERE exit_request_id = ?", (exit_request_id,)).fetchone()
+        if xr is None:
+            return None
+        xr = dict(xr)
+        trade = conn.execute("SELECT * FROM trades WHERE trade_id = ?", (xr["trade_id"],)).fetchone()
+        pos = conn.execute("SELECT * FROM paper_positions WHERE position_id = ?", (xr["position_id"],)).fetchone()
+        pending = _rows(conn, """
+            SELECT order_id, client_order_id, status, quantity, limit_price FROM paper_orders
+            WHERE position_id = ? AND side = 'SELL_TO_CLOSE' AND status = 'PENDING' ORDER BY order_id
+        """, (xr["position_id"],))
+
+    quote, quote_error = None, None
+    if pos is not None:
+        try:
+            quote = chain_provider.get_option_contract(pos["contract_symbol"])
+        except Exception as error:
+            quote_error = f"{type(error).__name__}: {str(error)[:200]}"
+
+    return ExitPolicyInput(
+        exit_request=ExitRequestState(
+            exit_request_id=xr["exit_request_id"], request_key=xr["request_key"], trade_id=xr["trade_id"],
+            position_id=xr["position_id"], requested_action=xr["requested_action"],
+            requested_quantity=xr["requested_quantity"], status=xr["status"], hard_exit=bool(xr["hard_exit"]),
+            data_issue_codes=json.loads(xr["data_issue_codes_json"]),
+        ),
+        trade=TradeStateSummary(trade_id=trade["trade_id"], state=trade["state"], position_id=trade["position_id"],
+                                proposal_key=trade["proposal_key"], signal_id=trade["signal_id"]) if trade else None,
+        position=ExitPositionState(position_id=pos["position_id"], status=pos["status"], quantity=pos["quantity"],
+                                   contract_symbol=pos["contract_symbol"],
+                                   contract_multiplier=pos["contract_multiplier"],
+                                   entry_price=pos["entry_price"]) if pos else None,
+        quote=quote,
+        quote_error=quote_error,
+        close_client_order_id=close_client_order_id,
+        pending_close_orders=[CloseOrderState(**r) for r in pending],
+        now_ms=now_ms,
+        limits=current_exit_limits(),
+        trading_mode=config.trading_mode(),
+        kill_switch=read_kill_switch(),
+    )
