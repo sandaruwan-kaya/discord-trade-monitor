@@ -166,7 +166,41 @@ def market_context_providers() -> list[str]:
 
 
 def provider_failure_cooldown_seconds() -> float:
-    return _float("MARKET_PROVIDER_COOLDOWN_SECONDS", 300)
+    # A failed provider (e.g. TradingView) is skipped for this long, then retried.
+    # MARKET_PROVIDER_COOLDOWN_SECONDS is the older name, still honoured.
+    legacy = os.getenv("MARKET_PROVIDER_COOLDOWN_SECONDS")
+    return _float("MARKET_PROVIDER_FAILURE_COOLDOWN_SECONDS", legacy if legacy not in (None, "") else 300)
+
+
+#
+# TradingView MCP (primary underlying market data when enabled).
+# Independent of the trading flags: it only changes where prices come from.
+# The Python app has its OWN OAuth client + tokens; Claude Code's are never used.
+#
+
+def tradingview_mcp_enabled() -> bool:
+    return _bool("TRADINGVIEW_MCP_ENABLED", False)
+
+
+def tradingview_mcp_url() -> str:
+    return os.getenv("TRADINGVIEW_MCP_URL") or "https://mcp.tradingview.com/mcp"
+
+
+def tradingview_config_dir() -> Path:
+    """Credential directory, OUTSIDE the git repository (chmod 700, files 600)."""
+    override = os.getenv("TRADINGVIEW_MCP_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    base = Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return (base / "discord-trade-monitor" / "tradingview").resolve()
+
+
+def tradingview_mcp_timeout_seconds() -> float:
+    return _float("TRADINGVIEW_MCP_TIMEOUT_SECONDS", 20)
+
+
+def tradingview_oauth_redirect_port() -> int:
+    return _int("TRADINGVIEW_OAUTH_REDIRECT_PORT", 8765)
 
 
 #

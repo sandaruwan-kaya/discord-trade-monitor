@@ -28,6 +28,7 @@ _TEST_ENV = {
     "AGENT4_ENABLED": "false",
     "AUTO_EXIT_ENABLED": "false",
     "TRADING_KILL_SWITCH": "0",
+    "TRADINGVIEW_MCP_ENABLED": "false",
 }
 
 os.environ.update(_TEST_ENV)
@@ -46,6 +47,14 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", _blocked)
     monkeypatch.setattr(socket.socket, "connect_ex", _blocked)
     monkeypatch.setattr(socket, "create_connection", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def temp_tradingview_dir(tmp_path, monkeypatch):
+    """TradingView credentials in tests always live in a throwaway directory."""
+    path = tmp_path / "tradingview"
+    monkeypatch.setenv("TRADINGVIEW_MCP_CONFIG_DIR", str(path))
+    return path
 
 
 @pytest.fixture(autouse=True)

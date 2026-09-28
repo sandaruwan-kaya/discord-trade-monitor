@@ -11,6 +11,7 @@ Agents depend on this module, never on a vendor directly.
 Candle format everywhere (same as market_data.py):
     {"timestamp": ms, "open", "high", "low", "close", "volume"}
 """
+import math
 import time
 from typing import Callable, Protocol
 
@@ -127,6 +128,7 @@ def context_from_candles(provider, symbol, candles, indicators=None) -> MarketCo
 
 class BinanceUSProvider:
     name = "binance_us"
+    label = "Binance.US"
 
     def get_current_price(self, symbol):
         return market_data.get_current_price(symbol)
@@ -158,8 +160,13 @@ class TradingViewMCPProvider:
 
     Exact-pair prices come from get_ohlcv, NOT the quote tool: the
     quote tool resolves BINANCE:BTCUSDT to the CRYPTO:BTCUSD index.
+    Note BINANCE:BTCUSDT on TradingView is Binance.com, not Binance.US.
+
+    Every payload is validated; anything malformed or for a different
+    symbol is rejected (ProviderError) so the chain falls back.
     """
     name = "tradingview_mcp"
+    label = "TradingView MCP (BINANCE:* = Binance.com)"
 
     MAX_BARS = 5000
 
@@ -195,17 +202,42 @@ class TradingViewMCPProvider:
             }
         )
 
-        return [
-            {
-                "timestamp": int(bar["t"]) * 1000,
-                "open": float(bar["o"]),
-                "high": float(bar["h"]),
-                "low": float(bar["l"]),
-                "close": float(bar["c"]),
-                "volume": float(bar.get("v") or 0),
-            }
-            for bar in payload.get("bars", [])
-        ]
+        requested = self.tv_symbol(symbol)
+        returned = payload.get("symbol")
+        if returned is not None and returned != requested:
+            # Never silently accept e.g. an aggregate BTCUSD for BINANCE:BTCUSDT.
+            raise ProviderError(f"symbol mismatch: requested {requested}, got {str(returned)[:40]}")
+
+        bars = payload.get("bars")
+        if not isinstance(bars, list):
+            raise ProviderError("malformed ohlcv payload: no bars list")
+
+        candles = []
+        previous_ts = None
+        for bar in bars:
+            try:
+                candle = {
+                    "timestamp": int(bar["t"]) * 1000,
+                    "open": float(bar["o"]),
+                    "high": float(bar["h"]),
+                    "low": float(bar["l"]),
+                    "close": float(bar["c"]),
+                    "volume": float(bar.get("v") or 0),
+                }
+            except (KeyError, TypeError, ValueError):
+                raise ProviderError("malformed ohlcv bar") from None
+            prices = (candle["open"], candle["high"], candle["low"], candle["close"])
+            if (
+                not all(math.isfinite(p) and p > 0 for p in prices)
+                or candle["high"] < max(candle["open"], candle["close"], candle["low"])
+                or candle["low"] > min(candle["open"], candle["close"])
+                or (previous_ts is not None and candle["timestamp"] <= previous_ts)
+            ):
+                raise ProviderError("malformed ohlcv bar values")
+            previous_ts = candle["timestamp"]
+            candles.append(candle)
+
+        return candles
 
     def get_current_price(self, symbol):
         candles = self._ohlcv(symbol, "1m", 1)
@@ -293,6 +325,8 @@ class FallbackMarketDataProvider:
         self._log = log
         self._failed_at: dict[str, float] = {}
         self.name = "fallback(" + ",".join(p.name for p in self.providers) + ")"
+        self.active_provider = None
+        self.last_provider = None
 
     def _available(self):
         now = self._clock()
@@ -303,24 +337,66 @@ class FallbackMarketDataProvider:
         # If everything is cooling down, still try the last resort.
         return available or self.providers[-1:]
 
+    def _mark_ok(self, provider):
+        self._failed_at.pop(provider.name, None)
+        if self.active_provider != provider.name:
+            self._log(f"[MARKET] active provider: {getattr(provider, 'label', provider.name)}")
+            self.active_provider = provider.name
+
+    def _mark_failed(self, provider, what, error):
+        self._failed_at[provider.name] = self._clock()
+        # Type + truncated message only; never payloads/headers/tokens.
+        self._log(
+            f"[MARKET] {provider.name}.{what} failed: {type(error).__name__}: {str(error)[:200]} "
+            f"(skipped for {self.cooldown_seconds:g}s)"
+        )
+
     def _run(self, method, *args, **kwargs):
         last_error = None
 
         for provider in self._available():
             try:
                 result = getattr(provider, method)(*args, **kwargs)
-                self._failed_at.pop(provider.name, None)
+                self._mark_ok(provider)
+                self.last_provider = provider.name
                 return result
             except Exception as error:
-                self._failed_at[provider.name] = self._clock()
+                self._mark_failed(provider, method, error)
                 last_error = error
-                # Type + truncated message only; never payloads/headers.
-                self._log(
-                    f"[MARKET] {provider.name}.{method} failed: "
-                    f"{type(error).__name__}: {str(error)[:200]}"
-                )
 
         raise ProviderError(f"all market providers failed for {method}") from last_error
+
+    def run_consistent(self, fn, what="evaluation"):
+        """
+        Run fn(provider) with ONE provider for the whole unit of work (e.g. all
+        candle pages of one signal evaluation). If it fails part-way, its partial
+        results are discarded and the whole unit is re-run on the next provider:
+        data from two sources is never combined. Returns (provider_name, result).
+        """
+        last_error = None
+        for provider in self._available():
+            try:
+                result = fn(provider)
+                self._mark_ok(provider)
+                self.last_provider = provider.name
+                return provider.name, result
+            except Exception as error:
+                self._mark_failed(provider, what, error)
+                last_error = error
+        raise ProviderError(f"all market providers failed for {what}") from last_error
+
+    def mark_unavailable(self, name, reason):
+        """Put a provider into cooldown without calling it (e.g. not authenticated at startup)."""
+        self._failed_at[name] = self._clock()
+        self._log(f"[MARKET] {name} unavailable: {reason} (retry in {self.cooldown_seconds:g}s)")
+
+    def status(self):
+        now = self._clock()
+        return {
+            p.name: ("cooling_down" if now - self._failed_at.get(p.name, float("-inf")) < self.cooldown_seconds
+                     else "available")
+            for p in self.providers
+        }
 
     def get_current_price(self, symbol):
         return self._run("get_current_price", symbol)
@@ -353,3 +429,23 @@ def build_market_context_provider(tradingview_call_tool: ToolCaller | None = Non
         if n != "tradingview_mcp" or tradingview_call_tool is not None
     ] or ["binance_us"]
     return FallbackMarketDataProvider([build_provider(n, tradingview_call_tool) for n in names])
+
+
+def run_consistent(market, fn, what="evaluation"):
+    """One provider per unit of work, whether `market` is a chain or a single provider."""
+    if hasattr(market, "run_consistent"):
+        return market.run_consistent(fn, what)
+    return getattr(market, "name", "market"), fn(market)
+
+
+def build_market_provider(tradingview_client=None, log=print):
+    """
+    Underlying market data for the evaluator, option-chain pricing, policy and risk.
+      TradingView enabled -> TradingView MCP (primary) -> Binance.US (fallback), with cooldown
+      otherwise           -> Binance.US only, exactly as before
+    """
+    if tradingview_client is None:
+        return BinanceUSProvider()
+    return FallbackMarketDataProvider(
+        [TradingViewMCPProvider(call_tool=tradingview_client.call_tool), BinanceUSProvider()], log=log
+    )

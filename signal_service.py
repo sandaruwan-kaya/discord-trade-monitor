@@ -254,6 +254,7 @@ async def process_discord_message(
         new_status="DEVELOPING",
         details={
             "price_at_signal": price_at_signal,
+            "price_source": getattr(services.market, "last_provider", None) or getattr(services.market, "name", None),
             "rejected_targets": rejected_targets
         }
     )
@@ -403,11 +404,19 @@ async def monitor_signal(row, services: Services):
         else:
             start_ms = cursor + MINUTE_MS
 
-        candles = await asyncio.to_thread(
-            fetch_candles_since,
+        #
+        # All candle pages for this evaluation come from ONE provider. If
+        # the preferred provider fails part-way, its partial data is
+        # discarded and the whole fetch re-runs on the fallback.
+        #
+
+        from tools.market_tools import run_consistent
+
+        market_source, candles = await asyncio.to_thread(
+            run_consistent,
             services.market,
-            signal.symbol,
-            start_ms
+            lambda provider: fetch_candles_since(provider, signal.symbol, start_ms),
+            f"candles {signal.symbol}"
         )
 
         closed = [c for c in candles if c["timestamp"] + MINUTE_MS <= now_ms]
@@ -425,6 +434,7 @@ async def monitor_signal(row, services: Services):
 
         if closed:
             state = evaluate_signal(signal, closed, state, targets=valid_targets)
+            state["market_source"] = market_source          # audit: provider of the latest candles
             cursor = closed[-1]["timestamp"]
 
             database.update_eval_state(row["id"], state, cursor)
@@ -504,7 +514,8 @@ async def monitor_signal(row, services: Services):
             new_status=new_status,
             details={
                 "current_price": assessment["current_price"],
-                "last_processed_candle_ms": cursor
+                "last_processed_candle_ms": cursor,
+                "market_source": market_source
             }
         )
 

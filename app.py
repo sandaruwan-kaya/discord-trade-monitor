@@ -16,10 +16,11 @@ from llm_client import OpenAILLMClient
 from agents.options_agent import OptionsSelectionAgent
 from agents.signal_agent import SignalAnalysisAgent
 from tools.market_tools import (
-    BinanceUSProvider,
-    build_market_context_provider
+    build_market_context_provider,
+    build_market_provider
 )
 from tools.options_tools import MockDeribitChainProvider
+from tradingview_mcp_client import build_tradingview_client
 from signal_service import (
     Services,
     database_row_to_signal,  # noqa: F401  (kept importable from app)
@@ -57,24 +58,52 @@ client = discord.Client(
 #
 # Runtime dependencies.
 #
-# The evaluator keeps using Binance.US candles (one consistent
-# feed per signal). Agent context prefers TradingView MCP and
-# falls back to Binance.US.
+# LLM (all agents + parser): OpenAI, unchanged.
+# Underlying market data:
+#   TRADINGVIEW_MCP_ENABLED=false -> Binance.US only (exactly as before)
+#   TRADINGVIEW_MCP_ENABLED=true  -> TradingView MCP (app's own OAuth) -> Binance.US fallback,
+#                                    failed provider skipped for MARKET_PROVIDER_FAILURE_COOLDOWN_SECONDS
+# Option chain: MockDeribitChainProvider (simulated bid/ask/Greeks), priced off that market feed.
+# TradingView provides NO option data.
 #
 
-binance_us = BinanceUSProvider()
+tradingview = build_tradingview_client()          # None unless TRADINGVIEW_MCP_ENABLED=true
+market = build_market_provider(tradingview)
 
 services = Services(
     parse_message=parse_discord_message,
-    market=binance_us,
+    market=market,
     notify=send_telegram,
-    context_market=build_market_context_provider(),
+    context_market=build_market_context_provider(tradingview.call_tool if tradingview else None),
     signal_agent=SignalAnalysisAgent(OpenAILLMClient()),
-    # V1: mock Deribit-style chain priced off the same Binance.US feed
-    # the evaluator uses. Proposals only; no broker is wired.
-    option_chain=MockDeribitChainProvider(binance_us),
+    option_chain=MockDeribitChainProvider(market),
     options_agent=OptionsSelectionAgent(OpenAILLMClient())
 )
+
+
+def report_market_sources():
+    """Startup check + clear logs of the active sources. Never raises, never logs secrets."""
+    if tradingview is None:
+        print("[MARKET] TradingView MCP: disabled (TRADINGVIEW_MCP_ENABLED=false)")
+        print("[MARKET] Primary active provider: Binance.US")
+    elif not tradingview.auth.has_credentials():
+        print("[MARKET] TradingView MCP not authenticated; using Binance.US "
+              "(run: venv/bin/python scripts/setup_tradingview_mcp.py)")
+        for chain in (market, services.context_market):
+            if hasattr(chain, "mark_unavailable"):
+                chain.mark_unavailable("tradingview_mcp", "not authenticated")
+        print("[MARKET] Primary active provider: Binance.US")
+    elif tradingview.check():
+        print("[MARKET] TradingView MCP: authenticated")
+        print("[MARKET] Primary provider: TradingView MCP (BINANCE:BTCUSDT / BINANCE:ETHUSDT = Binance.com)")
+        print("[MARKET] Fallback provider: Binance.US")
+    else:
+        print(f"[MARKET] TradingView MCP: unavailable ({tradingview.last_error}); using Binance.US")
+        for chain in (market, services.context_market):
+            if hasattr(chain, "mark_unavailable"):
+                chain.mark_unavailable("tradingview_mcp", "startup check failed")
+        print("[MARKET] Primary active provider: Binance.US")
+    print("[MARKET] Option chain: MockDeribitChainProvider (simulated bid/ask/Greeks; TradingView has no options data)")
 
 
 #
@@ -316,6 +345,8 @@ async def main():
 
     initialize_database()
 
+    await asyncio.to_thread(report_market_sources)
+
     #
     # Single process: any PENDING proposal claim left over from a
     # previous run was interrupted. Mark FAILED, never retry.
@@ -366,6 +397,8 @@ async def main():
         done, pending = await asyncio.wait(tasks, timeout=30)
         for task in pending:
             task.cancel()
+        if tradingview is not None:
+            tradingview.close()
 
 
 if __name__ == "__main__":

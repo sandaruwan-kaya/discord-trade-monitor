@@ -37,6 +37,8 @@ class Clock:
 class PriceFeed:
     """Binance-like feed driven by a per-minute price schedule (price holds until changed)."""
 
+    name = "fake"
+
     def __init__(self, clock, prices, width):
         self.clock = clock
         self.schedule = {}          # symbol -> {minute: price}

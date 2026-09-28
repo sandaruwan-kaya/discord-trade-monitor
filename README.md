@@ -116,3 +116,22 @@ Agent 4 REDUCE rule: REDUCE_REQUESTED returns to WORKING only on a FRESH context
 (`llm_used`, `llm_status=CALLED`, `risk_state=CONTEXTUAL`). Throttled / fallback / deterministic HOLDs keep the
 advisory; each assessment is applied once (`trade_assessment_applications`) and lifecycle events are written only
 when something actually changes.
+
+## TradingView MCP (optional primary market data)
+
+See `ARCHITECTURE.md`. OpenAI remains the LLM for the parser and Agents 1-3; TradingView only supplies underlying
+market data (and optional technical context). The option chain stays `MockDeribitChainProvider`.
+
+```bash
+# one-time authorization of the app's own OAuth client (never reuses Claude Code's login)
+venv/bin/python scripts/setup_tradingview_mcp.py            # needs: ssh -L 8765:127.0.0.1:8765 ec2-user@<host>
+venv/bin/python scripts/setup_tradingview_mcp.py --manual   # or paste the redirect URL
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TRADINGVIEW_MCP_ENABLED` | `false` | Use TradingView MCP as the primary underlying feed (Binance.US fallback) |
+| `MARKET_PROVIDER_FAILURE_COOLDOWN_SECONDS` | `300` | A failed provider is skipped this long, then retried |
+| `TRADINGVIEW_MCP_CONFIG_DIR` | `~/.config/discord-trade-monitor/tradingview` | Credential directory (outside the repo, 0700/0600) |
+| `TRADINGVIEW_MCP_TIMEOUT_SECONDS` | `20` | Per-call timeout |
+| `TRADINGVIEW_OAUTH_REDIRECT_PORT` | `8765` | Loopback port for the setup callback |

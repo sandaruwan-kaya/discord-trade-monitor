@@ -62,25 +62,27 @@ def gather_risk_input(position_id, chain_provider, market, now_ms, context_marke
     except Exception as error:
         quote_error = f"{type(error).__name__}: {str(error)[:200]}"
 
+    # Price + latest candle + entry candle from ONE provider (never mixed).
+    from tools.market_tools import run_consistent
+
+    def snapshot(provider):
+        opened_ms = _iso_to_ms(pos["opened_at"])
+        return (
+            provider.get_current_price(underlying),
+            provider.get_candles(underlying, "1m", 2),
+            provider.get_candles(underlying, "1m", 1, (opened_ms // 60_000) * 60_000),
+        )
+
     price = last_candle = price_at_entry = None
     try:
-        price = market.get_current_price(underlying)
-    except Exception:
-        pass
-    try:
-        candles = market.get_candles(underlying, "1m", 2)
+        _, (price, candles, entry_candles) = run_consistent(market, snapshot, f"risk snapshot {underlying}")
         if candles:
             c = candles[-1]
             last_candle = Candle(timestamp=c["timestamp"], high=c["high"], low=c["low"], close=c["close"])
-    except Exception:
-        pass
-    try:
-        opened_ms = _iso_to_ms(pos["opened_at"])
-        entry_candles = market.get_candles(underlying, "1m", 1, (opened_ms // 60_000) * 60_000)
         if entry_candles:
             price_at_entry = entry_candles[0]["close"]
     except Exception:
-        pass
+        pass                                              # -> DATA_UNAVAILABLE (fail closed), never invented
 
     context = None
     if context_market is not None:
