@@ -6,3 +6,4 @@ trade_monitor.db
 backups/
 *.db
 .pytest_cache/
+KILL_SWITCH

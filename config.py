@@ -151,6 +151,16 @@ def risk(name):
     return _float(name, default)
 
 
+def kill_switch_env() -> bool:
+    return _bool("TRADING_KILL_SWITCH", False)
+
+
+def kill_switch_file() -> Path:
+    """Presence of this file blocks new entries (touch it to halt, rm to resume)."""
+    override = os.getenv("KILL_SWITCH_FILE")
+    return Path(override).resolve() if override else PROJECT_DIR / "KILL_SWITCH"
+
+
 def allowed_underlyings() -> list[str]:
     raw = os.getenv("ALLOWED_UNDERLYINGS", "BTCUSDT,ETHUSDT")
     return [s.strip().upper() for s in raw.split(",") if s.strip()]

@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now_iso():
@@ -95,6 +95,9 @@ def migrate(conn):
 
     if version < 3:
         _migrate_v3(conn)
+
+    if version < 4:
+        _migrate_v4(conn)
 
 
 def _migrate_v1(conn):
@@ -320,6 +323,48 @@ def _migrate_v3(conn):
             conn.execute(sql)
 
         conn.execute("PRAGMA user_version = 3")
+
+
+def _migrate_v4(conn):
+    """
+    Policy decisions audit. Each row stores the exact input snapshot and
+    the exact limits used, so later config changes never rewrite history.
+    evaluation_key (hash of the input snapshot) is UNIQUE: re-running the
+    same snapshot never duplicates a row; a newer snapshot is a new row.
+    """
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS policy_decisions (
+                decision_id TEXT PRIMARY KEY,
+                evaluation_key TEXT NOT NULL UNIQUE,
+                proposal_key TEXT NOT NULL,
+                signal_id INTEGER,
+                purpose TEXT NOT NULL,
+                approved INTEGER NOT NULL CHECK (approved IN (0, 1)),
+                decision TEXT NOT NULL CHECK (decision IN ('APPROVED', 'REJECTED')),
+                reasons_json TEXT NOT NULL,
+                calculated_max_loss REAL,
+                calculated_total_open_risk REAL,
+                quote_age_seconds REAL,
+                checked_at TEXT NOT NULL,
+                input_json TEXT NOT NULL,
+                policy_snapshot_json TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                CHECK ((approved = 1) = (decision = 'APPROVED'))
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_policy_decisions_proposal
+            ON policy_decisions(proposal_key)
+            """
+        )
+
+        conn.execute("PRAGMA user_version = 4")
 
 
 def save_signal(

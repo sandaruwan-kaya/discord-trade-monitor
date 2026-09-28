@@ -454,3 +454,119 @@ class BrokerOrderResult(BaseModel):
     position: Optional[PaperPosition] = None
     idempotent_replay: bool = False
     message: str = ""
+
+
+#
+# Policy engine (deterministic; no LLM)
+#
+
+PolicyPurpose = Literal["ENTRY", "EXIT"]
+
+
+class RiskLimits(BaseModel):
+    """Exact limits used for one decision (persisted as the policy snapshot)."""
+    required_trading_mode: Literal["paper"] = "paper"
+    allowed_underlyings: list[str]
+    allowed_strategies: list[Strategy]
+    max_contracts: int
+    max_premium_per_trade: float
+    max_daily_loss: float
+    max_open_positions: int
+    min_dte: float
+    max_dte: float
+    min_abs_delta: float
+    max_abs_delta: float
+    max_spread_pct: float
+    min_open_interest: float
+    min_volume: float
+    max_quote_age_seconds: float
+    fee_per_contract: float
+    max_underlying_move_pct: float
+    max_target_progress_pct: float
+    signal_expiry_hours: dict[str, float]     # by timeframe bucket
+
+
+class KillSwitchState(BaseModel):
+    env_enabled: bool
+    file_enabled: bool
+    file_path: str
+
+    @property
+    def active(self) -> bool:
+        return self.env_enabled or self.file_enabled
+
+
+class OpenPositionSummary(BaseModel):
+    position_id: str
+    signal_id: Optional[int] = None
+    proposal_key: Optional[str] = None
+    contract_symbol: str
+    quantity: int
+    entry_price: float
+    contract_multiplier: float
+    premium_at_risk: float
+
+
+class PendingEntrySummary(BaseModel):
+    order_id: str
+    signal_id: Optional[int] = None
+    proposal_key: Optional[str] = None
+    contract_symbol: str
+    quantity: int
+    limit_price: float
+    premium_at_risk: float
+
+
+class AccountSnapshot(BaseModel):
+    open_position_count: int
+    pending_entry_count: int
+    open_premium_at_risk: float        # OPEN positions + PENDING entry orders
+    realized_pnl_today: float          # UTC day, from SELL_TO_CLOSE fills
+    unrealized_pnl: float
+    available_paper_buying_power: Optional[float] = None
+
+
+class ThesisContext(BaseModel):
+    """Current state of the originating signal, from the DB + latest Agent 1 run."""
+    signal: Optional[SignalAnalysisInput]   # levels, timing, price at signal; None if missing
+    signal_status: str                 # evaluator status: DEVELOPING/WORKING/TARGET_HIT/...
+    signal_active: bool
+    agent1_state: Optional[SignalState] = None
+
+
+class PolicyEvaluationInput(BaseModel):
+    purpose: PolicyPurpose = "ENTRY"
+    proposal: OptionProposal
+    thesis: ThesisContext
+    underlying_price: Optional[float]
+    quote: Optional[OptionContract]    # FRESH quote; None if the fetch failed
+    account: AccountSnapshot
+    open_positions: list[OpenPositionSummary]
+    pending_entries: list[PendingEntrySummary]
+    filled_entry_proposal_keys: list[str]
+    now_ms: int
+    limits: RiskLimits
+    trading_mode: str
+    kill_switch: KillSwitchState
+
+
+class PolicySnapshot(BaseModel):
+    limits: RiskLimits
+    trading_mode: str
+    kill_switch: KillSwitchState
+
+
+class PolicyDecision(BaseModel):
+    decision_id: str
+    evaluation_key: str
+    purpose: PolicyPurpose
+    approved: bool
+    decision: Literal["APPROVED", "REJECTED"]
+    reasons: list[str]
+    checked_at: str
+    proposal_key: str
+    signal_id: Optional[int] = None
+    policy_snapshot: PolicySnapshot
+    calculated_max_loss: Optional[float] = None
+    calculated_total_open_risk: Optional[float] = None
+    quote_age_seconds: Optional[float] = None
