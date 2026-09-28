@@ -36,6 +36,7 @@ TRADE_MONITOR_DB=/tmp/paper_demo.db venv/bin/python scripts/paper_broker_demo.py
 TRADE_MONITOR_DB=/tmp/policy_demo.db venv/bin/python scripts/policy_demo.py        # scratch DB only
 TRADE_MONITOR_DB=/tmp/execution_demo.db venv/bin/python scripts/execution_demo.py  # scratch DB only
 TRADE_MONITOR_DB=/tmp/risk_demo.db venv/bin/python scripts/risk_demo.py            # scratch DB only, uses OpenAI
+TRADE_MONITOR_DB=/tmp/tm_demo.db venv/bin/python scripts/trade_manager_demo.py     # scratch DB only
 ```
 
 ## Configuration (.env)
@@ -54,6 +55,7 @@ TRADE_MONITOR_DB=/tmp/risk_demo.db venv/bin/python scripts/risk_demo.py         
 | `KILL_SWITCH_FILE` | project `KILL_SWITCH` | If this file exists, new entries are blocked (`touch KILL_SWITCH` / `rm KILL_SWITCH`) |
 | `AGENT3_LLM_INTERVAL_MINUTES` / `AGENT3_MATERIAL_MOVE_PCT` / `AGENT3_MATERIAL_PNL_CHANGE_PCT` | `15` / `0.5` / `10` | Agent 3 LLM throttle (hard risk rules are never throttled) |
 | `HARD_PREMIUM_STOP_PCT` / `MAX_POSITION_LOSS` / `MAX_HOLD_DAYS` | `50` / `0` (off) / `5` | Agent 3 hard exits; PnL is bid-based |
+| `AGENT4_AT_RISK_INVALIDATION_DISTANCE_PCT` / `AGENT4_AT_RISK_PNL_PCT` | `0.5` / `35` | Agent 4: HOLD but this close to invalidation or this deep in (bid-based) loss -> AT_RISK |
 | `EXECUTION_CLAIM_TIMEOUT_SECONDS` | `120` | A CLAIMED/SUBMITTING execution older than this is reconciled by client_order_id (never re-submitted) |
 | `TRADING_MODE` | `paper` | Only `paper` exists; any other value makes the broker refuse to start |
 | `TRADE_MONITOR_DB` | project `trade_monitor.db` | DB path override |

@@ -215,6 +215,20 @@ def agent3_material_pnl_change_pct() -> float:
 
 
 #
+# Agent 4 (trade lifecycle)
+#
+
+def agent4_at_risk_invalidation_distance_pct() -> float:
+    # HOLD but the underlying is within this % of invalidation -> AT_RISK.
+    return _float("AGENT4_AT_RISK_INVALIDATION_DISTANCE_PCT", 0.5)
+
+
+def agent4_at_risk_pnl_pct() -> float:
+    # HOLD but bid-based PnL is at or below -this % -> AT_RISK.
+    return _float("AGENT4_AT_RISK_PNL_PCT", 35)
+
+
+#
 # Execution service
 #
 

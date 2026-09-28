@@ -741,3 +741,121 @@ class RiskAssessment(BaseModel):
     assessed_at: str
     input_snapshot: RiskAnalysisInput
     validation_notes: list[str] = Field(default_factory=list)
+
+
+#
+# Agent 4 — Trade lifecycle (deterministic)
+#
+
+TradeState = Literal[
+    "PROPOSED", "POLICY_APPROVED", "ORDER_SUBMITTED", "ORDER_PENDING",
+    "OPEN", "WORKING", "AT_RISK", "REDUCE_REQUESTED", "EXIT_REQUESTED",
+    "CLOSE_ORDER_PENDING", "CLOSED", "REJECTED", "CANCELLED", "FAILED",
+]
+
+TradeAction = Literal["NONE", "REQUEST_REDUCE", "REQUEST_EXIT", "WAIT_FOR_DATA", "MARK_CLOSED"]
+
+ExitRequestStatus = Literal["ACTIVE", "COMPLETED", "SUPERSEDED"]
+
+
+class LifecycleLimits(BaseModel):
+    at_risk_invalidation_distance_pct: float
+    at_risk_pnl_pct: float
+
+
+class BrokerPositionState(BaseModel):
+    position_id: str
+    status: str                        # OPEN / CLOSED
+    quantity: int
+    contract_symbol: str
+
+
+class BrokerOrderState(BaseModel):
+    order_id: str
+    side: str
+    status: str
+    quantity: int
+
+
+class RiskAssessmentSummary(BaseModel):
+    assessment_id: str
+    position_id: str
+    recommendation: RiskRecommendation
+    risk_state: RiskState
+    hard_rule_triggered: bool
+    hard_rule_codes: list[str]
+    data_issue_codes: list[str]
+    reasons: list[str]
+    unrealized_pnl_pct: Optional[float] = None
+    distance_to_invalidation_pct: Optional[float] = None
+    assessed_at_ms: int
+
+
+class ExitRequestSummary(BaseModel):
+    exit_request_id: str
+    request_key: str
+    requested_action: Literal["REDUCE", "EXIT"]
+    status: ExitRequestStatus
+    hard_exit: bool
+
+
+class TradeManagementInput(BaseModel):
+    trade_id: str
+    signal_id: Optional[int]
+    proposal_key: Optional[str]
+    execution_id: Optional[str]
+    position_id: str
+    current_state: str                 # validated against TradeState (fails closed)
+    position: Optional[BrokerPositionState]
+    close_order: Optional[BrokerOrderState] = None     # latest SELL_TO_CLOSE for the position
+    latest_risk_assessment: Optional[RiskAssessmentSummary] = None
+    assessment_already_processed: bool = False
+    active_exit_request: Optional[ExitRequestSummary] = None
+    active_reduce_request: Optional[ExitRequestSummary] = None
+    opened_at: Optional[str] = None
+    now_ms: int
+    limits: LifecycleLimits
+
+
+class ExitRequestIntent(BaseModel):
+    """What Agent 4 wants persisted. Quantity is deterministic, never from an LLM."""
+    request_key: str
+    requested_action: Literal["REDUCE", "EXIT"]
+    requested_quantity: Optional[int]  # EXIT: full open quantity; REDUCE: None (advisory, V1)
+    hard_exit: bool
+    reason_codes: list[str]
+    data_issue_codes: list[str]
+
+
+class TradeManagementDecision(BaseModel):
+    trade_id: str
+    previous_state: str
+    next_state: str
+    action: TradeAction
+    reason_codes: list[str]
+    reasons: list[str]
+    risk_assessment_id: Optional[str]
+    transition_allowed: bool
+    decided_at: str
+    exit_request: Optional[ExitRequestIntent] = None
+    evidence_for_exit_request_id: Optional[str] = None
+    resolve_requests: dict[str, ExitRequestStatus] = Field(default_factory=dict)
+
+
+class ExitRequest(BaseModel):
+    exit_request_id: str
+    request_key: str
+    trade_id: str
+    position_id: str
+    signal_id: Optional[int]
+    proposal_key: Optional[str]
+    risk_assessment_id: Optional[str]
+    requested_action: Literal["REDUCE", "EXIT"]
+    requested_quantity: Optional[int]
+    hard_exit: bool
+    reason_codes: list[str]
+    data_issue_codes: list[str]
+    status: ExitRequestStatus
+    created_at: str
+    updated_at: str
+    completed_at: Optional[str] = None

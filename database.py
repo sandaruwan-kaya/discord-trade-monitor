@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def utc_now_iso():
@@ -104,6 +104,9 @@ def migrate(conn):
 
     if version < 6:
         _migrate_v6(conn)
+
+    if version < 7:
+        _migrate_v7(conn)
 
 
 def _migrate_v1(conn):
@@ -481,6 +484,95 @@ def _migrate_v6(conn):
         )
 
         conn.execute("PRAGMA user_version = 6")
+
+
+TRADE_STATES = (
+    "PROPOSED", "POLICY_APPROVED", "ORDER_SUBMITTED", "ORDER_PENDING", "OPEN", "WORKING",
+    "AT_RISK", "REDUCE_REQUESTED", "EXIT_REQUESTED", "CLOSE_ORDER_PENDING", "CLOSED",
+    "REJECTED", "CANCELLED", "FAILED",
+)
+
+
+def _migrate_v7(conn):
+    """
+    Agent 4 lifecycle. One trade per position / execution. Every processed
+    risk assessment is applied at most once per trade (partial UNIQUE index).
+    At most one ACTIVE full-exit request per position (partial UNIQUE index).
+    """
+    states = ", ".join(f"'{s}'" for s in TRADE_STATES)
+
+    with conn:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS trades (
+                trade_id TEXT PRIMARY KEY,
+                signal_id INTEGER,
+                proposal_key TEXT,
+                execution_id TEXT UNIQUE REFERENCES execution_attempts(execution_id),
+                position_id TEXT NOT NULL UNIQUE REFERENCES paper_positions(position_id),
+                state TEXT NOT NULL CHECK (state IN ({states})),
+                opened_at TEXT,
+                closed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS trade_lifecycle_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT NOT NULL REFERENCES trades(trade_id),
+                from_state TEXT CHECK (from_state IS NULL OR from_state IN ({states})),
+                to_state TEXT NOT NULL CHECK (to_state IN ({states})),
+                action TEXT NOT NULL,
+                reason_codes_json TEXT NOT NULL,
+                reasons_json TEXT NOT NULL,
+                risk_assessment_id TEXT,
+                exit_request_id TEXT,
+                details_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exit_requests (
+                exit_request_id TEXT PRIMARY KEY,
+                request_key TEXT NOT NULL UNIQUE,
+                trade_id TEXT NOT NULL REFERENCES trades(trade_id),
+                position_id TEXT NOT NULL,
+                signal_id INTEGER,
+                proposal_key TEXT,
+                risk_assessment_id TEXT,
+                requested_action TEXT NOT NULL CHECK (requested_action IN ('REDUCE', 'EXIT')),
+                requested_quantity INTEGER,
+                hard_exit INTEGER NOT NULL CHECK (hard_exit IN (0, 1)),
+                reason_codes_json TEXT NOT NULL,
+                data_issue_codes_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'COMPLETED', 'SUPERSEDED')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                CHECK (requested_action = 'REDUCE' OR requested_quantity > 0),
+                CHECK (requested_action = 'EXIT' OR requested_quantity IS NULL)
+            )
+            """
+        )
+
+        for sql in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_assessment "
+            "ON trade_lifecycle_events(trade_id, risk_assessment_id) WHERE risk_assessment_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_full_exit "
+            "ON exit_requests(position_id) WHERE requested_action = 'EXIT' AND status = 'ACTIVE'",
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_trade ON trade_lifecycle_events(trade_id)",
+            "CREATE INDEX IF NOT EXISTS idx_exit_requests_position ON exit_requests(position_id)",
+        ):
+            conn.execute(sql)
+
+        conn.execute("PRAGMA user_version = 7")
 
 
 def save_signal(
