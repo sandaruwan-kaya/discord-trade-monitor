@@ -1,0 +1,8 @@
+discord.py==2.7.1
+openai==3.19.2
+pydantic==2.13.5
+python-dotenv==1.2.3
+requests==2.34.2
+
+# dev / tests
+pytest==9.1.1

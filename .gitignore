@@ -3,3 +3,6 @@ venv/
 __pycache__/
 *.pyc
 trade_monitor.db
+backups/
+*.db
+.pytest_cache/

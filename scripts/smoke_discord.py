@@ -1,3 +1,9 @@
+"""Live smoke script: hits real services. Never collected by pytest."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import os
 import discord
 from dotenv import load_dotenv

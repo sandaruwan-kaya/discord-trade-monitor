@@ -1,3 +1,9 @@
+"""Live smoke script: hits real services. Never collected by pytest."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from llm_parser import parse_discord_message
 
 message = """

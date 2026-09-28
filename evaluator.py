@@ -7,19 +7,11 @@ TERMINAL_STATUSES = {
 }
 
 
-def evaluate_signal(
-    signal: TradeSignal,
-    candles: list
-):
-    if not candles:
-        raise ValueError("No market candles supplied")
-
-    bias = (signal.bias or "").lower()
-
-    result = {
-        "current_price": candles[-1]["close"],
-        "highest_price": max(c["high"] for c in candles),
-        "lowest_price": min(c["low"] for c in candles),
+def new_state():
+    return {
+        "current_price": None,
+        "highest_price": None,
+        "lowest_price": None,
 
         "confirmation_above_hit": False,
         "confirmation_below_hit": False,
@@ -34,6 +26,52 @@ def evaluate_signal(
 
         "status": "DEVELOPING"
     }
+
+
+def evaluate_signal(
+    signal: TradeSignal,
+    candles: list,
+    state: dict | None = None,
+    targets: list | None = None
+):
+    """
+    Walk candles in chronological order.
+
+    state:   result of a previous call. When given, evaluation
+             continues from it, so callers only pass NEW candles.
+             Without it the walk starts fresh (original behaviour).
+
+    targets: targets to evaluate. Defaults to signal.targets.
+             The monitor passes the sanity-checked subset.
+    """
+    if not candles and state is None:
+        raise ValueError("No market candles supplied")
+
+    result = dict(state) if state else new_state()
+
+    if targets is None:
+        targets = signal.targets
+
+    if not candles:
+        return result
+
+    if result["status"] in TERMINAL_STATUSES:
+        return result
+
+    bias = (signal.bias or "").lower()
+
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+
+    if result["highest_price"] is not None:
+        highs.append(result["highest_price"])
+
+    if result["lowest_price"] is not None:
+        lows.append(result["lowest_price"])
+
+    result["current_price"] = candles[-1]["close"]
+    result["highest_price"] = max(highs)
+    result["lowest_price"] = min(lows)
 
     #
     # Walk through candles in chronological order.
@@ -116,10 +154,10 @@ def evaluate_signal(
         # the inferred directional bias.
         #
 
-        if signal.targets:
+        if targets:
 
             if "bull" in bias:
-                first_target = min(signal.targets)
+                first_target = min(targets)
 
                 if high >= first_target:
                     result["target_hit"] = True
@@ -129,7 +167,7 @@ def evaluate_signal(
                     return result
 
             elif "bear" in bias:
-                first_target = max(signal.targets)
+                first_target = max(targets)
 
                 if low <= first_target:
                     result["target_hit"] = True
