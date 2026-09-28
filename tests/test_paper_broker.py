@@ -476,8 +476,17 @@ def test_works_with_mock_deribit_chain(broker):
 def test_no_path_from_agents_or_app_to_broker():
     import pathlib
     root = pathlib.Path(config.PROJECT_DIR)
-    for rel in ["agents/options_agent.py", "agents/signal_agent.py", "signal_service.py", "app.py",
+    for rel in ["agents/options_agent.py", "agents/signal_agent.py", "agents/risk_agent.py",
+                "agents/trade_manager.py", "signal_service.py", "trading_pipeline.py",
                 "tools/options_tools.py", "tools/market_tools.py"]:
         text = (root / rel).read_text()
         assert "import broker" not in text and "from broker" not in text, rel
         assert "submit_order" not in text and "close_position" not in text, rel
+
+    # app.py is the composition root: it may only CONSTRUCT the paper broker via the
+    # paper-only factory (handed to ExecutionService); it never calls it.
+    app = (root / "app.py").read_text()
+    broker_imports = [l.strip() for l in app.splitlines() if "broker" in l and "import" in l]
+    assert broker_imports == ["from broker.factory import create_broker"]
+    for call in (".submit_order(", ".close_position(", ".cancel_order("):
+        assert call not in app

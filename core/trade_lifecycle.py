@@ -219,8 +219,14 @@ def decide(inp: TradeManagementInput) -> TradeManagementDecision:
     )
 
     if state == "REDUCE_REQUESTED":
+        # Only a FRESH contextual LLM HOLD may clear an advisory REDUCE.
+        # Throttled / fallback / deterministic HOLDs carry no new judgement.
+        if not a.fresh_contextual:
+            return out(codes=["REDUCE_RETAINED_HOLD_NOT_FRESH"],
+                       reasons=[f"HOLD is {a.risk_state}/{a.llm_status}, not a fresh contextual analysis; "
+                                "advisory reduce kept"])
         resolve = {active_reduce.exit_request_id: "SUPERSEDED"} if active_reduce else {}
-        return out("WORKING", "NONE", ["HOLD_AFTER_REDUCE"], ["Agent 3 HOLD; advisory reduce superseded"],
+        return out("WORKING", "NONE", ["HOLD_AFTER_REDUCE"], ["fresh Agent 3 HOLD; advisory reduce superseded"],
                    resolve_requests=resolve)
 
     if at_risk:

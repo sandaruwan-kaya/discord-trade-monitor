@@ -343,7 +343,13 @@ def build_provider(name: str, tradingview_call_tool: ToolCaller | None = None):
 
 
 def build_market_context_provider(tradingview_call_tool: ToolCaller | None = None):
-    """Provider chain for agent context (TradingView first, Binance.US fallback)."""
-    return FallbackMarketDataProvider(
-        [build_provider(n, tradingview_call_tool) for n in config.market_context_providers()]
-    )
+    """
+    Provider chain for agent context. TradingView MCP is included only when
+    its runtime client is actually configured (the app's own OAuth client,
+    never Claude Code's token); otherwise the chain is Binance.US only.
+    """
+    names = [
+        n for n in config.market_context_providers()
+        if n != "tradingview_mcp" or tradingview_call_tool is not None
+    ] or ["binance_us"]
+    return FallbackMarketDataProvider([build_provider(n, tradingview_call_tool) for n in names])

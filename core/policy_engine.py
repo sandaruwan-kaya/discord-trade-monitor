@@ -681,3 +681,79 @@ def gather_exit_input(exit_request_id, chain_provider, now_ms, close_client_orde
         trading_mode=config.trading_mode(),
         kill_switch=read_kill_switch(),
     )
+
+
+#
+# RESTING ENTRY validity — should a still-PENDING entry order stay alive?
+#
+# Pure and deterministic. A raw status flip (e.g. WORKING -> DEVELOPING on a
+# small pull-back below the entry level) is NOT a reason by itself; only a
+# genuinely invalid entry opportunity is.
+#
+
+def resting_entry_cancel_reasons(
+    proposal: OptionProposal,
+    signal,                     # SignalAnalysisInput or None
+    signal_status,
+    agent1_state,
+    underlying_price,
+    order_submitted_ms,
+    now_ms,
+    limits: RiskLimits,
+    kill_switch: KillSwitchState,
+    max_age_minutes,
+) -> list[str]:
+    reasons: list[str] = []
+
+    def add(code):
+        if code not in reasons:
+            reasons.append(code)
+
+    if _gt((now_ms - order_submitted_ms) / 60_000, max_age_minutes):
+        add("ENTRY_ORDER_EXPIRED")
+    if kill_switch.active:
+        add("KILL_SWITCH_ENABLED")
+
+    if signal is None:
+        add("SIGNAL_MISSING")
+        return reasons
+
+    if signal_status == "INVALIDATED":
+        add("SIGNAL_INVALIDATED")
+    elif signal_status == "TARGET_HIT":
+        add("TARGET_ALREADY_REACHED")
+    elif signal_status == "EXPIRED":
+        add("SIGNAL_EXPIRED")
+
+    if agent1_state == "STALE":
+        add("THESIS_STALE")
+    elif agent1_state == "NOT_TRADEABLE":
+        add("THESIS_NOT_TRADEABLE")
+
+    bucket = signal_rules.classify_timeframe(signal.timeframe)
+    expiry_ms = limits.signal_expiry_hours.get(bucket, limits.signal_expiry_hours["unknown"]) * 3_600_000
+    if now_ms - signal.signal_time_ms > expiry_ms:
+        add("SIGNAL_EXPIRED")
+
+    if underlying_price is None:
+        return reasons                          # cannot judge the price rules; age/kill switch still apply
+
+    facts = compute_facts(signal.model_copy(update={"current_price": underlying_price}), now_ms)
+
+    if facts.direction not in STRATEGY_FOR_DIRECTION or facts.default_target is None:
+        add("THESIS_NOT_TRADEABLE")
+        return reasons
+    if facts.invalidation_hit:
+        add("SIGNAL_INVALIDATED")
+    if facts.target_reached:
+        add("TARGET_ALREADY_REACHED")
+    if (facts.entry_crossed and facts.target_progress_pct is not None
+            and _gt(facts.target_progress_pct, limits.max_target_progress_pct)):
+        add("TARGET_PROGRESS_EXCEEDED")
+
+    entry_ref = facts.default_entry_level if facts.default_entry_level is not None else signal.price_at_signal
+    allowed, _, _ = check_entry_extension(facts.direction, entry_ref, underlying_price, limits.max_underlying_move_pct)
+    if not allowed:
+        add("ENTRY_STALE")
+
+    return reasons

@@ -82,10 +82,63 @@ def signal_expiry_hours(bucket: str) -> float:
 # Agent 1
 #
 
+#
+# Feature flags. AGENTIC_TRADING_ENABLED is the master switch: when it is
+# false the application behaves exactly like the original signal monitor,
+# whatever the component flags say. Every flag defaults to false.
+# No flag can enable a live broker (none exists).
+#
+
+def agentic_trading_enabled() -> bool:
+    return _bool("AGENTIC_TRADING_ENABLED", False)
+
+
+def _component(name) -> bool:
+    return agentic_trading_enabled() and _bool(name, False)
+
+
 def agent1_enabled() -> bool:
-    # Off by default: the existing intake flow is unchanged
-    # until this is switched on.
-    return _bool("AGENT1_ENABLED", False)
+    return _component("AGENT1_ENABLED")
+
+
+def paper_execution_enabled() -> bool:
+    return _component("PAPER_EXECUTION_ENABLED")
+
+
+def agent3_enabled() -> bool:
+    return _component("AGENT3_ENABLED")
+
+
+def agent4_enabled() -> bool:
+    return _component("AGENT4_ENABLED")
+
+
+def auto_exit_enabled() -> bool:
+    return _component("AUTO_EXIT_ENABLED")
+
+
+def agent1_telegram_debug() -> bool:
+    return _component("AGENT1_TELEGRAM_DEBUG")
+
+
+def notify_retry_seconds() -> float:
+    # A failed notification is retried at most once per this interval.
+    return _float("NOTIFY_RETRY_SECONDS", 60)
+
+
+def loop_seconds(name, default) -> float:
+    return _float(f"{name}_LOOP_SECONDS", default)
+
+
+def entry_order_max_age_minutes() -> float:
+    # A resting (PENDING) paper entry order older than this is cancelled.
+    return _float("ENTRY_ORDER_MAX_AGE_MINUTES", 15)
+
+
+def paper_entry_max_proposal_age_seconds() -> float:
+    # Only proposals finished this recently are executed (never stale backlog,
+    # e.g. proposals created while PAPER_EXECUTION_ENABLED was off).
+    return _float("PAPER_ENTRY_MAX_PROPOSAL_AGE_SECONDS", 300)
 
 
 def agent1_max_target_progress_pct() -> float:
@@ -172,7 +225,7 @@ def allowed_underlyings() -> list[str]:
 #
 
 def agent2_enabled() -> bool:
-    return _bool("AGENT2_ENABLED", False)
+    return _component("AGENT2_ENABLED")
 
 
 def agent2_max_confirmation_age_minutes() -> float:

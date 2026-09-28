@@ -160,12 +160,20 @@ class TradeManager:
             """,
             (trade["position_id"],)
         )
+        # The OLDEST assessment not yet applied to this trade. Applying them
+        # in order means an EXIT persisted by Agent 3 can never be skipped
+        # because a later HOLD arrived before this loop ran.
         ra = self._one(
             """
-            SELECT assessment_id, output_json, assessed_at_ms FROM risk_assessments WHERE position_id = ?
-            ORDER BY assessed_at_ms DESC, rowid DESC LIMIT 1
+            SELECT ra.assessment_id, ra.output_json, ra.assessed_at_ms FROM risk_assessments ra
+            WHERE ra.position_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM trade_assessment_applications x
+                  WHERE x.trade_id = ? AND x.assessment_id = ra.assessment_id
+              )
+            ORDER BY ra.assessed_at_ms ASC, ra.rowid ASC LIMIT 1
             """,
-            (trade["position_id"],)
+            (trade["position_id"], trade_id)
         )
 
         summary = None
@@ -179,10 +187,12 @@ class TradeManager:
                 unrealized_pnl_pct=o.get("unrealized_pnl_pct"),
                 distance_to_invalidation_pct=o.get("distance_to_invalidation_pct"),
                 assessed_at_ms=ra["assessed_at_ms"],
+                llm_used=bool(o.get("llm_used")),
+                llm_status=o.get("llm_status"),
             )
 
         processed = bool(summary) and self._one(
-            "SELECT 1 FROM trade_lifecycle_events WHERE trade_id = ? AND risk_assessment_id = ?",
+            "SELECT 1 FROM trade_assessment_applications WHERE trade_id = ? AND assessment_id = ?",
             (trade_id, summary.assessment_id)
         ) is not None
 
@@ -227,11 +237,23 @@ class TradeManager:
         self._persist(decision, inp)
         return decision
 
+    def process_until_current(self, trade_id, max_steps=500):
+        """Apply every unapplied assessment in order; stop when nothing changes."""
+        decisions = []
+        for _ in range(max_steps):
+            d = self.process(trade_id)
+            if d is None:
+                break
+            decisions.append(d)
+            if not d.transition_allowed or d.risk_assessment_id is None:
+                break
+        return decisions
+
     def process_all(self):
         trades = self._all(
             "SELECT trade_id FROM trades WHERE state NOT IN ('CLOSED', 'REJECTED', 'CANCELLED', 'FAILED') ORDER BY created_at"
         )
-        return [self.process(t["trade_id"]) for t in trades]
+        return [d for t in trades for d in self.process_until_current(t["trade_id"])]
 
     def _persist(self, d: TradeManagementDecision, inp: TradeManagementInput):
         if not d.transition_allowed:
@@ -279,9 +301,22 @@ class TradeManager:
                         (d.next_state, now, d.next_state, now, d.trade_id, d.previous_state)
                     )
 
-                self._event(conn, d.trade_id, d.previous_state, d.next_state, d.action, d.reason_codes,
-                            d.reasons, d.risk_assessment_id, exit_request_id,
-                            {"resolved_requests": d.resolve_requests}, now)
+                if d.risk_assessment_id is not None:
+                    # Applied exactly once (PRIMARY KEY); a duplicate raises and rolls back.
+                    conn.execute(
+                        "INSERT INTO trade_assessment_applications (trade_id, assessment_id, outcome, applied_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (d.trade_id, d.risk_assessment_id, ",".join(d.reason_codes) or d.action, now)
+                    )
+
+                meaningful = (
+                    d.next_state != d.previous_state or d.exit_request is not None
+                    or d.evidence_for_exit_request_id is not None or bool(d.resolve_requests)
+                )
+                if meaningful:
+                    self._event(conn, d.trade_id, d.previous_state, d.next_state, d.action, d.reason_codes,
+                                d.reasons, d.risk_assessment_id, exit_request_id,
+                                {"resolved_requests": d.resolve_requests}, now)
         except (_Stale, sqlite3.IntegrityError) as error:
             # Duplicate processing of the same assessment, or a concurrent change: no-op.
             self._log(f"[AGENT4] {d.trade_id}: not applied ({type(error).__name__})")

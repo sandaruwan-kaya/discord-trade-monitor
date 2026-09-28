@@ -798,6 +798,13 @@ class RiskAssessmentSummary(BaseModel):
     unrealized_pnl_pct: Optional[float] = None
     distance_to_invalidation_pct: Optional[float] = None
     assessed_at_ms: int
+    llm_used: bool = False
+    llm_status: Optional[str] = None
+
+    @property
+    def fresh_contextual(self) -> bool:
+        """A NEW, successful contextual LLM analysis (not throttled / fallback / deterministic)."""
+        return self.llm_used and self.llm_status == "CALLED" and self.risk_state == "CONTEXTUAL"
 
 
 class ExitRequestSummary(BaseModel):

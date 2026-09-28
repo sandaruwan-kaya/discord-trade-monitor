@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 
 def utc_now_iso():
@@ -110,6 +110,12 @@ def migrate(conn):
 
     if version < 8:
         _migrate_v8(conn)
+
+    if version < 9:
+        _migrate_v9(conn)
+
+    if version < 10:
+        _migrate_v10(conn)
 
 
 def _migrate_v1(conn):
@@ -645,6 +651,61 @@ def _migrate_v8(conn):
                 conn.execute(f"ALTER TABLE exit_requests ADD COLUMN {name} TEXT")
 
         conn.execute("PRAGMA user_version = 8")
+
+
+def _migrate_v9(conn):
+    """
+    Trade-event notifications. notification_key is UNIQUE, so a restart
+    never resends an event that was already SENT. Rows are written only
+    after the underlying state change has been committed.
+    """
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notifications (
+                notification_key TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('PENDING', 'SENT', 'FAILED')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_attempt_at_ms INTEGER,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            )
+            """
+        )
+        conn.execute("PRAGMA user_version = 9")
+
+
+def _migrate_v10(conn):
+    """
+    Agent 4 assessment application marker, separate from lifecycle events:
+    every risk assessment is applied to a trade at most once (PRIMARY KEY),
+    while trade_lifecycle_events only records things that actually happened
+    (state change, new request, exit evidence, resolved request). Existing
+    assessment-bearing events are backfilled as applications.
+    """
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_assessment_applications (
+                trade_id TEXT NOT NULL REFERENCES trades(trade_id),
+                assessment_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                PRIMARY KEY (trade_id, assessment_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO trade_assessment_applications (trade_id, assessment_id, outcome, applied_at)
+            SELECT trade_id, risk_assessment_id, 'BACKFILLED', created_at
+            FROM trade_lifecycle_events WHERE risk_assessment_id IS NOT NULL
+            """
+        )
+        conn.execute("PRAGMA user_version = 10")
 
 
 def save_signal(

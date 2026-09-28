@@ -1,4 +1,5 @@
 import os
+import signal
 import asyncio
 import traceback
 
@@ -24,7 +25,8 @@ from signal_service import (
     database_row_to_signal,  # noqa: F401  (kept importable from app)
     build_status_message,    # noqa: F401
     process_discord_message,
-    run_monitor_cycle
+    run_monitor_cycle,
+    run_proposal_cycle
 )
 
 
@@ -76,6 +78,70 @@ services = Services(
 
 
 #
+# Paper-trading pipeline (built only when the master switch is on; every
+# component inside is additionally gated by its own flag).
+#
+
+stop_event = asyncio.Event()
+pipeline = None
+
+
+def build_pipeline():
+    from agents.risk_agent import RiskAnalysisAgent
+    from broker.factory import create_broker
+    from notifications import Notifier
+    from trading_pipeline import TradingPipeline
+
+    return TradingPipeline(
+        signal_services=services,
+        broker=create_broker(services.option_chain),       # PaperBroker only; refuses non-paper modes
+        chain_provider=services.option_chain,
+        market=services.market,
+        risk_agent=RiskAnalysisAgent(OpenAILLMClient()),
+        notifier=Notifier(send_telegram),
+        context_market=services.context_market,
+    )
+
+
+async def _sleep_or_stop(seconds):
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def run_loop(name, seconds, cycle):
+    """Isolated loop: its failures never stop Discord, the monitor, or other loops."""
+    print(f"[{name}] loop started (every {seconds:g}s)")
+    while not stop_event.is_set():
+        try:
+            await cycle()
+        except Exception as error:
+            print(f"[{name}] cycle failed: {type(error).__name__}: {str(error)[:300]}")
+            traceback.print_exc()
+        await _sleep_or_stop(seconds)
+    print(f"[{name}] loop stopped")
+
+
+async def proposal_entry_cycle():
+    finished = await run_proposal_cycle(services)
+    await asyncio.to_thread(pipeline.after_proposals, finished)
+    await asyncio.to_thread(pipeline.entry_cycle)
+
+
+async def risk_cycle():
+    await asyncio.to_thread(pipeline.risk_cycle)
+
+
+async def lifecycle_cycle():
+    await asyncio.to_thread(pipeline.lifecycle_cycle)
+
+
+async def exit_cycle():
+    await asyncio.to_thread(pipeline.exit_cycle)
+
+
+#
 # Background monitor
 #
 
@@ -92,7 +158,7 @@ async def signal_monitor():
         "Checking active signals every 60 seconds."
     )
 
-    while not client.is_closed():
+    while not client.is_closed() and not stop_event.is_set():
 
         try:
 
@@ -109,7 +175,7 @@ async def signal_monitor():
 
             traceback.print_exc()
 
-        await asyncio.sleep(
+        await _sleep_or_stop(
             60
         )
 
@@ -143,8 +209,16 @@ async def on_ready():
     )
 
     print(
-        f"Agent 2 (paper proposals only): "
-        f"{'ENABLED' if config.agent2_enabled() else 'disabled'}"
+        f"Agentic trading (master): "
+        f"{'ENABLED' if config.agentic_trading_enabled() else 'disabled'}"
+    )
+
+    print(
+        f"Agent 2 proposals: {'ENABLED' if config.agent2_enabled() else 'disabled'} | "
+        f"paper entries: {'ENABLED' if config.paper_execution_enabled() else 'disabled'} | "
+        f"Agent 3: {'ENABLED' if config.agent3_enabled() else 'disabled'} | "
+        f"Agent 4: {'ENABLED' if config.agent4_enabled() else 'disabled'} | "
+        f"auto exit: {'ENABLED' if config.auto_exit_enabled() else 'disabled'}"
     )
 
     print("=" * 60)
@@ -221,10 +295,23 @@ async def on_message(
 # Start everything
 #
 
+async def shutdown():
+    """Stop creating new work, let active cycles finish their DB writes, close Discord."""
+    if stop_event.is_set():
+        return
+    print("\nShutdown requested: no new work will be started.")
+    stop_event.set()
+    if pipeline is not None:
+        pipeline.stopping = True
+    await client.close()
+
+
 async def main():
 
+    global pipeline
+
     #
-    # Create / migrate SQLite tables if required.
+    # 1. Create / migrate SQLite tables if required.
     #
 
     initialize_database()
@@ -240,20 +327,45 @@ async def main():
         print(f"[AGENT2] {key}: interrupted at last shutdown, marked FAILED")
 
     #
-    # Start background monitor.
+    # 2-6. Startup reconciliation BEFORE any loop can create new work.
     #
 
-    asyncio.create_task(
-        signal_monitor()
-    )
+    if config.agentic_trading_enabled():
+        pipeline = build_pipeline()
+        await asyncio.to_thread(pipeline.startup_reconcile)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown()))
+        except NotImplementedError:
+            pass
 
     #
-    # Start Discord.
+    # 7. Start loops, then Discord.
     #
 
-    await client.start(
-        DISCORD_BOT_TOKEN
-    )
+    tasks = [asyncio.create_task(signal_monitor())]
+
+    if pipeline is not None:
+        tasks += [
+            asyncio.create_task(run_loop("AGENT2/ENTRY", config.loop_seconds("PROPOSAL", 30), proposal_entry_cycle)),
+            asyncio.create_task(run_loop("RISK", config.loop_seconds("RISK", 60), risk_cycle)),
+            asyncio.create_task(run_loop("LIFECYCLE", config.loop_seconds("LIFECYCLE", 60), lifecycle_cycle)),
+            asyncio.create_task(run_loop("EXIT", config.loop_seconds("EXIT", 30), exit_cycle)),
+        ]
+
+    try:
+        await client.start(
+            DISCORD_BOT_TOKEN
+        )
+    finally:
+        stop_event.set()
+        if pipeline is not None:
+            pipeline.stopping = True
+        done, pending = await asyncio.wait(tasks, timeout=30)
+        for task in pending:
+            task.cancel()
 
 
 if __name__ == "__main__":

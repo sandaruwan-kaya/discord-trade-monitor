@@ -38,6 +38,7 @@ TRADE_MONITOR_DB=/tmp/execution_demo.db venv/bin/python scripts/execution_demo.p
 TRADE_MONITOR_DB=/tmp/risk_demo.db venv/bin/python scripts/risk_demo.py            # scratch DB only, uses OpenAI
 TRADE_MONITOR_DB=/tmp/tm_demo.db venv/bin/python scripts/trade_manager_demo.py     # scratch DB only
 TRADE_MONITOR_DB=/tmp/exit_demo.db venv/bin/python scripts/exit_execution_demo.py  # scratch DB only
+TRADE_MONITOR_DB=/tmp/full_pipeline_demo.db venv/bin/python scripts/full_pipeline_demo.py  # scratch DB, OpenAI, no Telegram sends
 ```
 
 ## Configuration (.env)
@@ -84,3 +85,34 @@ TRADE_MONITOR_DB=/tmp/exit_demo.db venv/bin/python scripts/exit_execution_demo.p
   order) are final `POLICY_REJECTED` for operator review. REDUCE requests are `NOT_EXECUTABLE_V1`.
 - Lifecycle: EXIT_REQUESTED -> CLOSE_ORDER_PENDING -> CLOSED (both events recorded even on an immediate fill); the
   exit request becomes COMPLETED only when the broker position is actually closed.
+
+## Paper-trading pipeline (integrated, OFF by default)
+
+See `.env.example`. `AGENTIC_TRADING_ENABLED=false` (the default) runs the original signal monitor only.
+With the master switch on, each stage additionally needs its own flag:
+
+| Flag | Loop | Effect |
+|---|---|---|
+| `AGENT1_ENABLED` | intake | Agent 1 analysis stored per signal |
+| `AGENT2_ENABLED` | B (30s) | first fresh WORKING -> one option proposal |
+| `PAPER_EXECUTION_ENABLED` | B | fresh entry policy -> paper BUY_TO_OPEN; pending fills reconciled; trades materialized |
+| `AGENT3_ENABLED` | C (60s) | risk assessments for OPEN trades |
+| `AGENT4_ENABLED` | D (60s) | lifecycle transitions, REDUCE/EXIT requests |
+| `AUTO_EXIT_ENABLED` | E (30s) | full EXIT requests executed (REDUCE never) |
+
+Startup order: migrate DB -> reconcile interrupted proposals/executions -> process pending paper orders ->
+materialize filled entries -> reconcile trades -> reconcile exits -> start loops and Discord. Each loop catches its
+own errors; SIGINT/SIGTERM stops new work, lets current cycles finish, then closes Discord. Trade-event Telegram
+messages are sent after persistence via the idempotent `notifications` table (never resent after a restart).
+
+Resting paper entries: each cycle, BEFORE any pending fill is processed, every PENDING entry is re-checked
+deterministically and cancelled (`ExecutionService.cancel_entry`) if it is older than `ENTRY_ORDER_MAX_AGE_MINUTES`
+(default 15), the signal is INVALIDATED / TARGET_HIT / EXPIRED, Agent 1 says STALE / NOT_TRADEABLE, the current price
+has hit invalidation or target, the chase or target-progress limit fails, or the kill switch is on. A temporary
+status flip on a small pull-back is not a reason. Broker truth wins: an order that already filled is recorded FILLED.
+The kill switch never touches exit orders.
+
+Agent 4 REDUCE rule: REDUCE_REQUESTED returns to WORKING only on a FRESH contextual LLM HOLD
+(`llm_used`, `llm_status=CALLED`, `risk_state=CONTEXTUAL`). Throttled / fallback / deterministic HOLDs keep the
+advisory; each assessment is applied once (`trade_assessment_applications`) and lifecycle events are written only
+when something actually changes.

@@ -20,7 +20,14 @@ _TEST_ENV = {
     "OPENAI_MODEL": "test-model",
     "TELEGRAM_BOT_TOKEN": "test-telegram-token",
     "TELEGRAM_CHAT_ID": "0",
+    "AGENTIC_TRADING_ENABLED": "false",
     "AGENT1_ENABLED": "false",
+    "AGENT2_ENABLED": "false",
+    "PAPER_EXECUTION_ENABLED": "false",
+    "AGENT3_ENABLED": "false",
+    "AGENT4_ENABLED": "false",
+    "AUTO_EXIT_ENABLED": "false",
+    "TRADING_KILL_SWITCH": "0",
 }
 
 os.environ.update(_TEST_ENV)

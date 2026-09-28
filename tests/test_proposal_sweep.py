@@ -13,7 +13,7 @@ import database
 from agents.options_agent import OptionsSelectionAgent
 from agents.signal_agent import SignalAnalysisAgent
 from schemas import OptionsSelectionLLMOutput
-from signal_service import Services, run_monitor_cycle, run_proposal_sweep
+from signal_service import Services, run_monitor_cycle, run_proposal_cycle, run_proposal_sweep
 from tools.options_tools import MockDeribitChainProvider
 
 from helpers import MINUTE_MS, T0, FakeMarket, bullish_signal
@@ -58,6 +58,7 @@ class SelectFirst:
 
 @pytest.fixture(autouse=True)
 def agent2_on(monkeypatch):
+    monkeypatch.setenv("AGENTIC_TRADING_ENABLED", "true")
     monkeypatch.setenv("AGENT2_ENABLED", "true")
 
 
@@ -97,6 +98,7 @@ def store_analysis(signal_id, state):
 
 def tick(services):
     asyncio.run(run_monitor_cycle(services))
+    asyncio.run(run_proposal_cycle(services))
 
 
 def advance(services, clock, market, minutes):

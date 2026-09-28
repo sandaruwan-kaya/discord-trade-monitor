@@ -446,11 +446,16 @@ def _code(path):
 
 # 24
 def test_agent2_and_app_layers_still_cannot_reach_broker_or_execution():
-    for rel in ["agents/options_agent.py", "agents/signal_agent.py", "signal_service.py", "app.py",
+    for rel in ["agents/options_agent.py", "agents/signal_agent.py", "signal_service.py",
                 "tools/options_tools.py", "tools/market_tools.py", "signal_facts.py"]:
         code = _code(rel)
         for banned in ("import broker", "from broker", "execution_service", "ExecutionService",
                        ".submit_order(", ".close_position(", ".cancel_order("):
+            assert banned not in code, (rel, banned)
+    # The pipeline and app may reach the broker ONLY through ExecutionService.
+    for rel in ("trading_pipeline.py", "app.py"):
+        code = _code(rel)
+        for banned in (".submit_order(", ".close_position(", ".cancel_order("):
             assert banned not in code, (rel, banned)
 
 

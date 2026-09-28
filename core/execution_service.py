@@ -386,24 +386,135 @@ class ExecutionService:
 
         return self._result(execution_key)
 
-    def reconcile_pending_executions(self, process_pending=True):
-        """Advance every PENDING / in-flight execution. Never submits a new order."""
+    def reconcile_pending_executions(self, process_pending=True, purpose=None, resume_exits=True):
+        """
+        Advance PENDING / in-flight executions. Never submits a new ENTRY
+        order. With resume_exits=True, WAITING/INTERRUPTED/FAILED exits may
+        submit their single close (same stable client_order_id); with
+        resume_exits=False exits are only reconciled against the broker.
+        """
         if process_pending:
             self.broker.process_pending_orders()
 
+        where = "(status IN ('ORDER_PENDING', 'CLAIMED', 'SUBMITTING')"
+        if resume_exits:
+            where += " OR (purpose = 'EXIT' AND status IN ('WAITING_FOR_QUOTE', 'INTERRUPTED', 'FAILED'))"
+        where += ")"
+        params = ()
+        if purpose:
+            where += " AND purpose = ?"
+            params = (purpose,)
+
         conn = self._connect()
         try:
-            keys = [r[0] for r in conn.execute(
-                "SELECT execution_key FROM execution_attempts "
-                "WHERE status IN ('ORDER_PENDING', 'CLAIMED', 'SUBMITTING') "
-                "   OR (purpose = 'EXIT' AND status IN ('WAITING_FOR_QUOTE', 'INTERRUPTED', 'FAILED')) "
-                "ORDER BY created_at"
+            rows = [dict(r) for r in conn.execute(
+                f"SELECT execution_key, purpose, status FROM execution_attempts WHERE {where} ORDER BY created_at",
+                params
             )]
         finally:
             conn.close()
 
-        return [self.reconcile_execution(k, process_pending=False) for k in keys]
+        results = []
+        for r in rows:
+            attempt = self.get_attempt(r["execution_key"])
+            if r["purpose"] == "EXIT" and not resume_exits:
+                # Broker-state reconciliation only: never a (re)submission.
+                if attempt["status"] in ("SUBMITTING", "ORDER_PENDING"):
+                    results.append(self._reconcile_exit_attempt(attempt, process_pending=False))
+                continue
+            results.append(self.reconcile_execution(r["execution_key"], process_pending=False))
+        return results
 
+
+    #
+    # Resting ENTRY order management (cancel only; never a new order)
+    #
+
+    def cancel_entry(self, execution_key, reasons) -> ExecutionResult:
+        """
+        Cancel a still-PENDING paper entry order. Broker truth first: if the
+        order already filled (or otherwise ended), that outcome is recorded and
+        wins. Idempotent: a non-PENDING execution is returned unchanged.
+        """
+        attempt = self.get_attempt(execution_key)
+        if attempt is None or attempt["purpose"] != "ENTRY":
+            return ExecutionResult(ok=False, status="REFUSED", persisted=False, error_code="NOT_AN_ENTRY_EXECUTION")
+        if attempt["status"] != "ORDER_PENDING":
+            return self._result(execution_key, replay=True)
+
+        order = self.broker.get_order(attempt["broker_order_id"])
+        if order is None:
+            self._log(f"[ENTRY] {execution_key}: broker order missing; nothing cancelled (fail closed)")
+            return self._result(execution_key, message="broker order missing")
+        if order.status != "PENDING":
+            return self._apply_broker_order(execution_key, {"ORDER_PENDING"}, order, "broker truth before cancel")
+
+        cancelled = self.broker.cancel_order(order.order_id)
+        if not cancelled.ok:
+            # Lost a race (e.g. it filled just now): record what the broker says.
+            order = self.broker.get_order(order.order_id)
+            return self._apply_broker_order(execution_key, {"ORDER_PENDING"}, order, cancelled.message)
+
+        self._transition(
+            execution_key, {"ORDER_PENDING"}, "ORDER_CANCELLED",
+            error_code=reasons[0], error_message=",".join(reasons),
+            result_json=json.dumps({"policy_reasons": [], "broker_order_status": "CANCELLED",
+                                    "cancel_reasons": reasons, "broker_order": cancelled.order.model_dump()}),
+        )
+        return self._result(execution_key)
+
+    def cancel_invalid_pending_entries(self):
+        """Run the deterministic resting-entry check for every PENDING entry; cancel the invalid ones."""
+        from signal_facts import build_input
+
+        conn = self._connect()
+        try:
+            pending = [dict(r) for r in conn.execute(
+                "SELECT * FROM execution_attempts WHERE purpose = 'ENTRY' AND status = 'ORDER_PENDING' ORDER BY created_at"
+            )]
+        finally:
+            conn.close()
+
+        results = []
+        limits = policy_engine.current_risk_limits()
+        kill_switch = policy_engine.read_kill_switch()
+
+        for attempt in pending:
+            key = attempt["execution_key"]
+            try:
+                order = self.broker.get_order(attempt["broker_order_id"])
+                if order is None:
+                    continue
+                if order.status != "PENDING":
+                    results.append(self._apply_broker_order(key, {"ORDER_PENDING"}, order, "broker truth"))
+                    continue
+
+                prop_row = database.get_proposal(attempt["proposal_key"])
+                try:
+                    proposal = OptionProposal.model_validate_json(prop_row["output_json"])
+                except Exception:
+                    results.append(self.cancel_entry(key, ["PROPOSAL_UNAVAILABLE"]))     # fail closed: reduce risk
+                    continue
+
+                row = database.get_signal(proposal.signal_id) if proposal.signal_id is not None else None
+                analysis = database.get_latest_signal_analysis(proposal.signal_id) if row else None
+                agent1_state = json.loads(analysis["output_json"])["signal_state"] if analysis else None
+                try:
+                    price = self.market.get_current_price(proposal.underlying)
+                except Exception:
+                    price = None
+
+                reasons = policy_engine.resting_entry_cancel_reasons(
+                    proposal, build_input(row) if row else None, row["status"] if row else None, agent1_state,
+                    price, _iso_to_ms(order.submitted_at), self._now_ms(), limits, kill_switch,
+                    config.entry_order_max_age_minutes(),
+                )
+                if reasons:
+                    self._log(f"[ENTRY] {key}: cancelling resting entry {reasons}")
+                    results.append(self.cancel_entry(key, reasons))
+            except Exception as error:
+                self._log(f"[ENTRY] {key}: resting-entry check failed ({type(error).__name__}); left as is")
+        return results
 
     #
     # EXIT execution (full exits only; paper only; no LLM)

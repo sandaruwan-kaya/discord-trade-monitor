@@ -163,9 +163,14 @@ def test_binance_provider_wraps_existing_market_data(monkeypatch):
     assert seen == {"symbol": "BTCUSDT", "interval": "1m", "limit": 1000, "start_ms": T0}
 
 
-def test_default_chain_prefers_tradingview_then_binance():
-    chain = market_tools.build_market_context_provider()
+def test_default_chain_prefers_tradingview_then_binance_when_configured():
+    chain = market_tools.build_market_context_provider(tradingview_call_tool=FakeTV())
     assert [p.name for p in chain.providers] == ["tradingview_mcp", "binance_us"]
+
+
+def test_chain_is_binance_only_without_tradingview_runtime_client():
+    chain = market_tools.build_market_context_provider()
+    assert [p.name for p in chain.providers] == ["binance_us"]
 
 
 def test_rsi_and_ema():

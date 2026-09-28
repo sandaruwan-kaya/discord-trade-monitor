@@ -14,7 +14,7 @@ import database
 from agents.options_agent import OptionsSelectionAgent
 from agents.signal_agent import SignalAnalysisAgent, build_input
 from schemas import OptionsSelectionLLMOutput
-from signal_service import Services, run_monitor_cycle
+from signal_service import Services, run_monitor_cycle, run_proposal_cycle
 from tools.options_tools import (
     STALE_ENTRY_REASON,
     MockDeribitChainProvider,
@@ -131,6 +131,7 @@ class World:
 
     def tick(self):
         asyncio.run(run_monitor_cycle(self.services))
+        asyncio.run(run_proposal_cycle(self.services))
 
     def advance(self, minutes, price=None):
         self.clock_ms = self.market.now_ms = T0 + int(minutes * MINUTE_MS)
@@ -143,6 +144,7 @@ class World:
 
 @pytest.fixture(autouse=True)
 def agent2_on(monkeypatch):
+    monkeypatch.setenv("AGENTIC_TRADING_ENABLED", "true")
     monkeypatch.setenv("AGENT2_ENABLED", "true")
     monkeypatch.setenv("AGENT2_MAX_UNDERLYING_MOVE_PCT", "0.5")
 

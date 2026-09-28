@@ -544,12 +544,16 @@ async def run_monitor_cycle(services: Services):
     for row in active_signals:
         await monitor_signal(row, services)
 
+
+async def run_proposal_cycle(services: Services):
+    """Loop B entry point: the Agent 2 sweep, only when enabled. Returns [(proposal_key, status)]."""
     if (
-        config.agent2_enabled()
-        and services.option_chain is not None
-        and services.options_agent is not None
+        not config.agent2_enabled()
+        or services.option_chain is None
+        or services.options_agent is None
     ):
-        await run_proposal_sweep(services)
+        return []
+    return await run_proposal_sweep(services)
 
 
 #
@@ -578,6 +582,8 @@ async def run_proposal_sweep(services: Services):
     ):
         services.log(f"[AGENT2] {key}: interrupted PENDING claim marked FAILED (not retried)")
 
+    finished = []
+
     for row in database.get_signals_awaiting_proposal():
         key = proposal_key(row["id"])
         state = json.loads(row["eval_state"]) if row.get("eval_state") else {}
@@ -594,6 +600,9 @@ async def run_proposal_sweep(services: Services):
             continue
 
         await _propose_for_signal(row, state, key, services, now_ms)
+        finished.append((key, (database.get_proposal(key) or {}).get("status")))
+
+    return finished
 
 
 async def _propose_for_signal(row, state, key, services: Services, now_ms):

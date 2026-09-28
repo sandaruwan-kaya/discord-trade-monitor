@@ -115,6 +115,7 @@ def test_agent1_disabled_by_default_runs_nothing():
 
 
 def test_agent1_enabled_persists_analysis(monkeypatch):
+    monkeypatch.setenv("AGENTIC_TRADING_ENABLED", "true")
     monkeypatch.setenv("AGENT1_ENABLED", "true")
     agent = SignalAnalysisAgent(llm=None, now_ms=lambda: T0 + 60_000)
 
@@ -130,6 +131,7 @@ def test_agent1_enabled_persists_analysis(monkeypatch):
 
 
 def test_agent1_failure_does_not_break_intake(monkeypatch):
+    monkeypatch.setenv("AGENTIC_TRADING_ENABLED", "true")
     monkeypatch.setenv("AGENT1_ENABLED", "true")
 
     class Broken:
@@ -141,3 +143,10 @@ def test_agent1_failure_does_not_break_intake(monkeypatch):
 
     assert database.get_signal(signal_id) is not None
     assert len(sent) == 1
+
+
+def test_agent1_flag_without_master_switch_does_nothing(monkeypatch):
+    monkeypatch.setenv("AGENT1_ENABLED", "true")                  # master switch still off
+    agent = SignalAnalysisAgent(llm=None, now_ms=lambda: T0 + 60_000)
+    signal_id = run(services_for(bullish_signal(), [], signal_agent=agent))
+    assert database.get_signal_analyses(signal_id) == []

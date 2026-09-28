@@ -25,10 +25,16 @@ from test_policy_engine import NOW
 POS = "PP-1"
 
 
-def ra(rec="HOLD", aid="RA-1", hard=False, codes=None, data=None, reasons=None, pnl=5.0, dist=2.0, pos=POS):
+def ra(rec="HOLD", aid="RA-1", hard=False, codes=None, data=None, reasons=None, pnl=5.0, dist=2.0, pos=POS,
+       risk_state=None, llm_used=None, llm_status=None):
+    default_state = "HARD_EXIT" if hard else ("DATA_UNAVAILABLE" if rec == "DATA_UNAVAILABLE" else "CONTEXTUAL")
+    state = risk_state or default_state
+    fresh = state == "CONTEXTUAL"
     return RiskAssessmentSummary(
         assessment_id=aid, position_id=pos, recommendation=rec,
-        risk_state="HARD_EXIT" if hard else ("DATA_UNAVAILABLE" if rec == "DATA_UNAVAILABLE" else "CONTEXTUAL"),
+        llm_used=fresh if llm_used is None else llm_used,
+        llm_status=(llm_status or ("CALLED" if fresh else {"THROTTLED": "THROTTLED", "FALLBACK": "FAILED"}.get(state))),
+        risk_state=state,
         hard_rule_triggered=hard, hard_rule_codes=codes or [], data_issue_codes=data or [],
         reasons=reasons if reasons is not None else ["THESIS_INTACT"], unrealized_pnl_pct=pnl,
         distance_to_invalidation_pct=dist, assessed_at_ms=NOW,
@@ -426,3 +432,104 @@ def test_agent4_modules_load_no_broker_execution_or_llm():
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == ""
+
+
+def test_exit_persisted_before_a_later_hold_is_never_skipped():
+    """Agent 3 wrote EXIT then HOLD before Agent 4 ran: both are applied in order; EXIT wins."""
+    tm, trade, *_ = filled_trade()
+    tid, pid = trade["trade_id"], trade["position_id"]
+    add_assessment(pid, "EXIT", hard=True, codes=["HARD_PREMIUM_STOP"])
+    add_assessment(pid, "HOLD")
+
+    decisions = [d for d in tm.process_all() if d.risk_assessment_id]
+
+    assert [(d.next_state, d.reason_codes) for d in decisions] == [
+        ("EXIT_REQUESTED", ["HARD_PREMIUM_STOP"]), ("EXIT_REQUESTED", ["EXIT_REQUEST_RETAINED"])]
+    assert tm.get_trade(tid)["state"] == "EXIT_REQUESTED"
+    assert len(tm.get_exit_requests(tid)) == 1
+    assert tm.process_all() == [] or all(d.risk_assessment_id is None for d in tm.process_all())
+
+
+#
+# REDUCE flapping fix: only a FRESH contextual LLM HOLD clears REDUCE_REQUESTED
+#
+
+def test_fresh_llm_reduce_enters_reduce_requested():
+    d = tl.decide(inp("WORKING", ra("REDUCE", reasons=["THETA_DECAY"])))
+    assert d.next_state == "REDUCE_REQUESTED" and d.exit_request.requested_action == "REDUCE"
+
+
+@pytest.mark.parametrize("kind,kwargs", [
+    ("throttled", {"risk_state": "THROTTLED", "llm_used": False, "llm_status": "THROTTLED"}),
+    ("fallback-failed", {"risk_state": "FALLBACK", "llm_used": False, "llm_status": "FAILED"}),
+    ("fallback-no-llm", {"risk_state": "FALLBACK", "llm_used": False, "llm_status": "NOT_CONFIGURED"}),
+    ("deterministic", {"risk_state": "CONTEXTUAL", "llm_used": False, "llm_status": "CALLED"}),
+])
+def test_non_fresh_hold_keeps_reduce_requested(kind, kwargs):
+    d = tl.decide(inp("REDUCE_REQUESTED", ra("HOLD", aid="RA-2", **kwargs), reduce_req=active_reduce()))
+    assert d.next_state == "REDUCE_REQUESTED", kind
+    assert d.exit_request is None and not d.resolve_requests
+    assert d.reason_codes == ["REDUCE_RETAINED_HOLD_NOT_FRESH"]
+
+
+def test_fresh_llm_hold_clears_reduce_and_supersedes_request():
+    d = tl.decide(inp("REDUCE_REQUESTED", ra("HOLD", aid="RA-2"), reduce_req=active_reduce()))
+    assert d.next_state == "WORKING" and d.resolve_requests == {"XR-R": "SUPERSEDED"}
+
+
+def test_exit_escalates_from_reduce_requested_even_when_not_fresh():
+    d = tl.decide(inp("REDUCE_REQUESTED", ra("EXIT", aid="RA-3", hard=True, codes=["HARD_PREMIUM_STOP"]),
+                      reduce_req=active_reduce()))
+    assert d.next_state == "EXIT_REQUESTED" and d.resolve_requests == {"XR-R": "SUPERSEDED"}
+
+
+def _add_throttled_hold(pid):
+    aid = add_assessment(pid, "HOLD")
+    conn = sqlite3.connect(config.db_path())
+    out = json.loads(conn.execute("SELECT output_json FROM risk_assessments WHERE assessment_id = ?", (aid,)).fetchone()[0])
+    out.update(risk_state="THROTTLED", llm_used=False, llm_status="THROTTLED")
+    conn.execute("UPDATE risk_assessments SET output_json = ? WHERE assessment_id = ?", (json.dumps(out), aid))
+    conn.commit()
+    return aid
+
+
+def _add_fresh(pid, rec, reasons):
+    aid = add_assessment(pid, rec, reasons=reasons)
+    conn = sqlite3.connect(config.db_path())
+    out = json.loads(conn.execute("SELECT output_json FROM risk_assessments WHERE assessment_id = ?", (aid,)).fetchone()[0])
+    out.update(llm_used=True, llm_status="CALLED")
+    conn.execute("UPDATE risk_assessments SET output_json = ? WHERE assessment_id = ?", (json.dumps(out), aid))
+    conn.commit()
+    return aid
+
+
+def test_db_reduce_sequence_no_flapping_no_duplicate_events():
+    tm, trade, *_ = filled_trade()
+    tid, pid = trade["trade_id"], trade["position_id"]
+
+    _add_fresh(pid, "REDUCE", ["THETA_DECAY"])
+    tm.process_all()
+    assert tm.get_trade(tid)["state"] == "REDUCE_REQUESTED"
+    events_before = len(tm.get_events(tid))
+
+    for _ in range(5):                                          # repeated throttled cycles
+        _add_throttled_hold(pid)
+        tm.process_all()
+    assert tm.get_trade(tid)["state"] == "REDUCE_REQUESTED"
+    assert len(tm.get_events(tid)) == events_before             # no new lifecycle events
+    assert len(tm.get_exit_requests(tid)) == 1                  # no new REDUCE request
+    assert len(rows("SELECT * FROM trade_assessment_applications WHERE trade_id = ?", (tid,))) == 6  # each applied once
+
+    _add_fresh(pid, "HOLD", ["THESIS_INTACT"])                  # fresh real LLM HOLD clears it
+    tm.process_all()
+    assert tm.get_trade(tid)["state"] == "WORKING"
+    assert [r.status for r in tm.get_exit_requests(tid)] == ["SUPERSEDED"]
+
+    _add_fresh(pid, "REDUCE", ["RISK_REWARD_DETERIORATED"])     # a new fresh REDUCE is allowed
+    tm.process_all()
+    assert tm.get_trade(tid)["state"] == "REDUCE_REQUESTED"
+    assert sorted(r.status for r in tm.get_exit_requests(tid)) == ["ACTIVE", "SUPERSEDED"]
+
+    add_assessment(pid, "EXIT", hard=True, codes=["MAX_HOLD_EXCEEDED"])
+    tm.process_all()
+    assert tm.get_trade(tid)["state"] == "EXIT_REQUESTED"
