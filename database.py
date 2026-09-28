@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now_iso():
@@ -98,6 +98,9 @@ def migrate(conn):
 
     if version < 4:
         _migrate_v4(conn)
+
+    if version < 5:
+        _migrate_v5(conn)
 
 
 def _migrate_v1(conn):
@@ -365,6 +368,67 @@ def _migrate_v4(conn):
         )
 
         conn.execute("PRAGMA user_version = 4")
+
+
+EXECUTION_STATUSES = (
+    "CLAIMED", "POLICY_REJECTED", "SUBMITTING", "ORDER_PENDING", "ORDER_FILLED",
+    "ORDER_REJECTED", "ORDER_CANCELLED", "FAILED", "INTERRUPTED",
+)
+
+
+def _migrate_v5(conn):
+    """
+    Execution attempts. execution_key and client_order_id are UNIQUE:
+    one execution per proposal, one stable broker identity per execution.
+    execution_events keeps every status transition (append-only history).
+    """
+    statuses = ", ".join(f"'{s}'" for s in EXECUTION_STATUSES)
+
+    with conn:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS execution_attempts (
+                execution_id TEXT PRIMARY KEY,
+                execution_key TEXT NOT NULL UNIQUE,
+                proposal_key TEXT NOT NULL,
+                signal_id INTEGER,
+                purpose TEXT NOT NULL CHECK (purpose IN ('ENTRY', 'EXIT')),
+                status TEXT NOT NULL CHECK (status IN ({statuses})),
+                policy_decision_id TEXT REFERENCES policy_decisions(decision_id),
+                client_order_id TEXT NOT NULL UNIQUE,
+                broker_order_id TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                input_json TEXT,
+                result_json TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                execution_id TEXT NOT NULL REFERENCES execution_attempts(execution_id),
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        for sql in (
+            "CREATE INDEX IF NOT EXISTS idx_execution_attempts_status ON execution_attempts(status)",
+            "CREATE INDEX IF NOT EXISTS idx_execution_attempts_proposal ON execution_attempts(proposal_key)",
+            "CREATE INDEX IF NOT EXISTS idx_execution_events_execution ON execution_events(execution_id)",
+        ):
+            conn.execute(sql)
+
+        conn.execute("PRAGMA user_version = 5")
 
 
 def save_signal(

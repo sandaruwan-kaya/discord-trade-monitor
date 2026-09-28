@@ -34,6 +34,7 @@ venv/bin/python scripts/agent1_demo.py "BTC break above 84,000 targets 85,200, i
 venv/bin/python scripts/agent2_demo.py BTCUSDT bullish 85200 82600
 TRADE_MONITOR_DB=/tmp/paper_demo.db venv/bin/python scripts/paper_broker_demo.py   # scratch DB only
 TRADE_MONITOR_DB=/tmp/policy_demo.db venv/bin/python scripts/policy_demo.py        # scratch DB only
+TRADE_MONITOR_DB=/tmp/execution_demo.db venv/bin/python scripts/execution_demo.py  # scratch DB only
 ```
 
 ## Configuration (.env)
@@ -50,6 +51,7 @@ TRADE_MONITOR_DB=/tmp/policy_demo.db venv/bin/python scripts/policy_demo.py     
 | `MONITOR_CANDLE_PAGE_SIZE` / `MONITOR_MAX_CANDLE_PAGES` | `1000` / `10` | Candle catch-up paging |
 | `TRADING_KILL_SWITCH` | `0` | `1` blocks all NEW entries at the Policy Engine (exits are exempt by design) |
 | `KILL_SWITCH_FILE` | project `KILL_SWITCH` | If this file exists, new entries are blocked (`touch KILL_SWITCH` / `rm KILL_SWITCH`) |
+| `EXECUTION_CLAIM_TIMEOUT_SECONDS` | `120` | A CLAIMED/SUBMITTING execution older than this is reconciled by client_order_id (never re-submitted) |
 | `TRADING_MODE` | `paper` | Only `paper` exists; any other value makes the broker refuse to start |
 | `TRADE_MONITOR_DB` | project `trade_monitor.db` | DB path override |
 | `AGENT2_ENABLED` | `false` | Create paper option proposals on first WORKING transition |

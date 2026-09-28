@@ -60,6 +60,14 @@ class BrokerBase(ABC):
     def get_order(self, order_id: str) -> PaperOrder | None: ...
 
     @abstractmethod
+    def get_order_by_client_id(self, client_order_id: str) -> PaperOrder | None:
+        """Stable-identity lookup used for crash reconciliation (never submits)."""
+
+    def process_pending_orders(self) -> list[BrokerOrderResult]:
+        """Simulation hook: re-check resting orders. Real venues fill on their own."""
+        return []
+
+    @abstractmethod
     def cancel_order(self, order_id: str) -> BrokerOrderResult:
         """Only PENDING orders can be cancelled."""
 

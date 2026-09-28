@@ -196,6 +196,16 @@ def agent2_pending_timeout_minutes() -> float:
 
 
 #
+# Execution service
+#
+
+def execution_claim_timeout_seconds() -> float:
+    # A CLAIMED/SUBMITTING execution older than this is considered
+    # interrupted and is reconciled (never re-submitted).
+    return _float("EXECUTION_CLAIM_TIMEOUT_SECONDS", 120)
+
+
+#
 # Mock Deribit-style option chain (V1 paper only).
 # Per-index settings, e.g. MOCK_OPTION_MULTIPLIER_BTC=0.01
 #

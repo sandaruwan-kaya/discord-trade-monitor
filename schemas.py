@@ -570,3 +570,31 @@ class PolicyDecision(BaseModel):
     calculated_max_loss: Optional[float] = None
     calculated_total_open_risk: Optional[float] = None
     quote_age_seconds: Optional[float] = None
+
+
+#
+# Execution service
+#
+
+ExecutionStatus = Literal[
+    "CLAIMED", "POLICY_REJECTED", "SUBMITTING", "ORDER_PENDING", "ORDER_FILLED",
+    "ORDER_REJECTED", "ORDER_CANCELLED", "FAILED", "INTERRUPTED",
+    "REFUSED",          # not persisted: proposal missing / not ready (retryable later)
+]
+
+
+class ExecutionResult(BaseModel):
+    ok: bool
+    status: ExecutionStatus
+    proposal_key: str
+    execution_id: Optional[str] = None
+    execution_key: Optional[str] = None
+    replay: bool = False
+    persisted: bool = True
+    policy_decision_id: Optional[str] = None
+    policy_reasons: list[str] = Field(default_factory=list)
+    client_order_id: Optional[str] = None
+    broker_order_id: Optional[str] = None
+    broker_order_status: Optional[OrderStatus] = None
+    error_code: Optional[str] = None
+    message: str = ""
