@@ -141,6 +141,7 @@ RISK_DEFAULTS = {
     "MAX_HOLD_DAYS": 5.0,
     "MAX_QUOTE_AGE_SECONDS": 60,
     "OPTION_FEE_PER_CONTRACT": 0.0,
+    "MAX_POSITION_LOSS": 0.0,          # absolute $ loss per position; 0 = disabled
 }
 
 
@@ -193,6 +194,24 @@ def agent2_max_llm_candidates() -> int:
 def agent2_pending_timeout_minutes() -> float:
     # PENDING claims older than this are interrupted -> FAILED, never retried.
     return _float("AGENT2_PENDING_TIMEOUT_MINUTES", 10)
+
+
+#
+# Agent 3 (risk analysis)
+#
+
+def agent3_llm_interval_minutes() -> float:
+    return _float("AGENT3_LLM_INTERVAL_MINUTES", 15)
+
+
+def agent3_material_move_pct() -> float:
+    # Underlying move since the last LLM assessment that bypasses the throttle.
+    return _float("AGENT3_MATERIAL_MOVE_PCT", 0.5)
+
+
+def agent3_material_pnl_change_pct() -> float:
+    # Change in bid-based PnL % (points) since the last LLM assessment that bypasses the throttle.
+    return _float("AGENT3_MATERIAL_PNL_CHANGE_PCT", 10)
 
 
 #

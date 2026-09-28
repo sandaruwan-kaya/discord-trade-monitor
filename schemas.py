@@ -598,3 +598,146 @@ class ExecutionResult(BaseModel):
     broker_order_status: Optional[OrderStatus] = None
     error_code: Optional[str] = None
     message: str = ""
+
+
+#
+# Agent 3 — Risk Analysis
+#
+
+RiskRecommendation = Literal["HOLD", "REDUCE", "EXIT", "DATA_UNAVAILABLE"]
+
+RiskState = Literal["HARD_EXIT", "DATA_UNAVAILABLE", "CONTEXTUAL", "THROTTLED", "FALLBACK"]
+
+LLMStatus = Literal["CALLED", "THROTTLED", "SKIPPED_HARD_EXIT", "SKIPPED_DATA", "FAILED", "NOT_CONFIGURED"]
+
+RISK_REASON_CODES = (
+    "THESIS_INTACT", "THESIS_DETERIORATING", "DELTA_DECAY", "IV_CRUSH", "IV_EXPANSION",
+    "THETA_DECAY", "NEAR_INVALIDATION", "NEAR_TARGET", "ADVERSE_MOMENTUM",
+    "VOLATILITY_EXPANSION", "VOLATILITY_CONTRACTION", "RISK_REWARD_DETERIORATED",
+    "HORIZON_ELAPSING", "PROFIT_PROTECTION", "OTHER",
+)
+
+
+class RiskRuleLimits(BaseModel):
+    hard_premium_stop_pct: float
+    max_position_loss: float          # 0 = disabled
+    max_hold_days: float
+    max_quote_age_seconds: float
+    llm_interval_minutes: float
+    material_move_pct: float
+    material_pnl_change_pct: float
+
+
+class RiskThesis(BaseModel):
+    direction: Direction
+    entry_level: Optional[float]
+    target: Optional[float]
+    invalidation: Optional[float]
+    timeframe: Optional[str]
+    signal_time_ms: int
+    signal_status: str                         # evaluator status
+    evaluator_target_time_ms: Optional[int] = None
+    evaluator_invalidation_time_ms: Optional[int] = None
+    recent_high: Optional[float] = None        # since the signal (evaluator state)
+    recent_low: Optional[float] = None
+
+
+class RiskPosition(BaseModel):
+    status: str
+    quantity: int
+    contract_multiplier: float
+    entry_option_price: float
+    opened_at_ms: int
+
+
+class Candle(BaseModel):
+    timestamp: int
+    high: float
+    low: float
+    close: float
+
+
+class LastLLMAssessment(BaseModel):
+    assessed_at_ms: int
+    underlying_price: Optional[float]
+    unrealized_pnl_pct: Optional[float]
+    recommendation: RiskRecommendation
+    risk_state: RiskState
+    confidence: float
+
+
+class RiskAnalysisInput(BaseModel):
+    position_id: str
+    signal_id: Optional[int]
+    proposal_key: Optional[str]
+    contract_symbol: str
+    thesis: RiskThesis
+    position: RiskPosition
+    quote: Optional[OptionContract]            # FRESH; None if unavailable
+    quote_error: Optional[str] = None
+    option_expiry_ts_ms: Optional[int] = None
+    underlying_price: Optional[float]
+    underlying_price_at_entry: Optional[float] = None
+    last_candle: Optional[Candle] = None       # latest coarse candle (intrabar ordering)
+    market_context: Optional[MarketContext] = None
+    now_ms: int
+    limits: RiskRuleLimits
+
+
+class RiskMetrics(BaseModel):
+    """Deterministic numbers. PnL uses the BID (realistic exit), mark only for display."""
+    entry_cost: float
+    liquidation_value: Optional[float]
+    unrealized_pnl: Optional[float]
+    unrealized_pnl_pct: Optional[float]
+    mark_value: Optional[float]
+    mark_pnl: Optional[float]
+    option_bid: Optional[float]
+    option_mark: Optional[float]
+    quote_age_seconds: Optional[float]
+    target_progress_pct: Optional[float]
+    distance_to_target_pct: Optional[float]
+    distance_to_invalidation_pct: Optional[float]
+    underlying_move_since_entry_pct: Optional[float]
+    time_in_trade_hours: float
+    hold_remaining_hours: float
+    dte: Optional[float]
+
+
+class RiskLLMOutput(BaseModel):
+    recommendation: Literal["HOLD", "REDUCE", "EXIT"]
+    confidence: float
+    reason_codes: list[str]
+    rationale: str
+
+
+class RiskAssessment(BaseModel):
+    assessment_id: str
+    assessment_key: str
+    position_id: str
+    signal_id: Optional[int]
+    proposal_key: Optional[str]
+    recommendation: RiskRecommendation
+    risk_state: RiskState
+    hard_rule_triggered: bool
+    hard_rule_codes: list[str]
+    data_issue_codes: list[str]
+    llm_used: bool
+    llm_status: LLMStatus
+    llm_trigger: Optional[str] = None
+    last_contextual_recommendation: Optional[RiskRecommendation] = None
+    last_contextual_at_ms: Optional[int] = None
+    confidence: float
+    reasons: list[str]
+    metrics: RiskMetrics
+    underlying_price: Optional[float]
+    option_bid: Optional[float]
+    option_mark: Optional[float]
+    unrealized_pnl: Optional[float]
+    unrealized_pnl_pct: Optional[float]
+    target_progress_pct: Optional[float]
+    distance_to_invalidation_pct: Optional[float]
+    time_in_trade_hours: float
+    assessed_at: str
+    input_snapshot: RiskAnalysisInput
+    validation_notes: list[str] = Field(default_factory=list)

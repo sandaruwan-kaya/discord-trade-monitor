@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now_iso():
@@ -101,6 +101,9 @@ def migrate(conn):
 
     if version < 5:
         _migrate_v5(conn)
+
+    if version < 6:
+        _migrate_v6(conn)
 
 
 def _migrate_v1(conn):
@@ -429,6 +432,55 @@ def _migrate_v5(conn):
             conn.execute(sql)
 
         conn.execute("PRAGMA user_version = 5")
+
+
+def _migrate_v6(conn):
+    """
+    Agent 3 risk assessments. assessment_key (hash of the market/position
+    snapshot) is UNIQUE: an identical snapshot is stored once; a newer
+    quote/price is a new row. Rows are append-only.
+    """
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS risk_assessments (
+                assessment_id TEXT PRIMARY KEY,
+                assessment_key TEXT NOT NULL UNIQUE,
+                position_id TEXT NOT NULL REFERENCES paper_positions(position_id),
+                signal_id INTEGER,
+                recommendation TEXT NOT NULL
+                    CHECK (recommendation IN ('HOLD', 'REDUCE', 'EXIT', 'DATA_UNAVAILABLE')),
+                risk_state TEXT NOT NULL,
+                hard_rule_triggered INTEGER NOT NULL CHECK (hard_rule_triggered IN (0, 1)),
+                hard_rule_codes_json TEXT NOT NULL,
+                data_issue_codes_json TEXT NOT NULL,
+                llm_used INTEGER NOT NULL CHECK (llm_used IN (0, 1)),
+                llm_status TEXT NOT NULL,
+                reasons_json TEXT NOT NULL,
+                underlying_price REAL,
+                option_bid REAL,
+                option_mark REAL,
+                unrealized_pnl REAL,
+                unrealized_pnl_pct REAL,
+                assessed_at TEXT NOT NULL,
+                assessed_at_ms INTEGER NOT NULL,
+                input_json TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                CHECK (hard_rule_triggered = 0 OR recommendation = 'EXIT'),
+                CHECK (hard_rule_triggered = 0 OR llm_used = 0)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_risk_assessments_position
+            ON risk_assessments(position_id, assessed_at_ms)
+            """
+        )
+
+        conn.execute("PRAGMA user_version = 6")
 
 
 def save_signal(
