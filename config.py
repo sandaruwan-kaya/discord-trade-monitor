@@ -117,21 +117,82 @@ def provider_failure_cooldown_seconds() -> float:
 
 
 #
-# Paper-trading risk defaults (demo values only; consumed from Step 5 on).
+# Paper-trading risk defaults (demo values only, all overridable in .env).
+# Read at call time so .env / test overrides always apply.
 #
 
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 
-MAX_PREMIUM_PER_TRADE = _float("MAX_PREMIUM_PER_TRADE", 500)
-MAX_CONTRACTS = _int("MAX_CONTRACTS", 2)
-MAX_DAILY_LOSS = _float("MAX_DAILY_LOSS", 1000)
-MAX_OPEN_POSITIONS = _int("MAX_OPEN_POSITIONS", 3)
-MIN_DTE = _int("MIN_DTE", 7)
-MAX_DTE = _int("MAX_DTE", 45)
-MIN_ABS_DELTA = _float("MIN_ABS_DELTA", 0.35)
-MAX_ABS_DELTA = _float("MAX_ABS_DELTA", 0.65)
-MAX_BID_ASK_SPREAD_PCT = _float("MAX_BID_ASK_SPREAD_PCT", 10)
-MIN_OPEN_INTEREST = _int("MIN_OPEN_INTEREST", 100)
-MIN_OPTION_VOLUME = _int("MIN_OPTION_VOLUME", 10)
-HARD_PREMIUM_STOP_PCT = _float("HARD_PREMIUM_STOP_PCT", 50)
-MAX_HOLD_DAYS = _float("MAX_HOLD_DAYS", 5)
+RISK_DEFAULTS = {
+    "MAX_PREMIUM_PER_TRADE": 500.0,
+    "MAX_CONTRACTS": 2,
+    "MAX_DAILY_LOSS": 1000.0,
+    "MAX_OPEN_POSITIONS": 3,
+    "MIN_DTE": 7,
+    "MAX_DTE": 45,
+    "MIN_ABS_DELTA": 0.35,
+    "MAX_ABS_DELTA": 0.65,
+    "MAX_BID_ASK_SPREAD_PCT": 10.0,
+    "MIN_OPEN_INTEREST": 100,
+    "MIN_OPTION_VOLUME": 10,
+    "HARD_PREMIUM_STOP_PCT": 50.0,
+    "MAX_HOLD_DAYS": 5.0,
+    "MAX_QUOTE_AGE_SECONDS": 60,
+    "OPTION_FEE_PER_CONTRACT": 0.0,
+}
+
+
+def risk(name):
+    default = RISK_DEFAULTS[name]
+    if isinstance(default, int):
+        return _int(name, default)
+    return _float(name, default)
+
+
+def allowed_underlyings() -> list[str]:
+    raw = os.getenv("ALLOWED_UNDERLYINGS", "BTCUSDT,ETHUSDT")
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
+#
+# Agent 2
+#
+
+def agent2_enabled() -> bool:
+    return _bool("AGENT2_ENABLED", False)
+
+
+def agent2_max_confirmation_age_minutes() -> float:
+    # A WORKING transition detected later than this after the
+    # confirming candle never produces a proposal.
+    return _float("AGENT2_MAX_CONFIRMATION_AGE_MINUTES", 15)
+
+
+def agent2_max_underlying_move_pct() -> float:
+    # Chase protection: if the underlying already moved more than this
+    # beyond the entry level in the trade direction, no proposal.
+    return _float("AGENT2_MAX_UNDERLYING_MOVE_PCT", 0.5)
+
+
+def agent2_max_llm_candidates() -> int:
+    return _int("AGENT2_MAX_LLM_CANDIDATES", 8)
+
+
+def agent2_pending_timeout_minutes() -> float:
+    # PENDING claims older than this are interrupted -> FAILED, never retried.
+    return _float("AGENT2_PENDING_TIMEOUT_MINUTES", 10)
+
+
+#
+# Mock Deribit-style option chain (V1 paper only).
+# Per-index settings, e.g. MOCK_OPTION_MULTIPLIER_BTC=0.01
+#
+
+MOCK_OPTION_DEFAULTS = {
+    "BTC": {"MULTIPLIER": 0.01, "STRIKE_STEP": 1000.0, "TICK": 5.0, "BASE_IV": 0.50, "PEAK_OI": 3000.0},
+    "ETH": {"MULTIPLIER": 0.1, "STRIKE_STEP": 25.0, "TICK": 0.5, "BASE_IV": 0.65, "PEAK_OI": 5000.0},
+}
+
+
+def mock_option_setting(index: str, key: str) -> float:
+    return _float(f"MOCK_OPTION_{key}_{index}", MOCK_OPTION_DEFAULTS[index][key])

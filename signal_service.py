@@ -42,6 +42,8 @@ class Services:
     notify: Callable[[str], Any]
     context_market: Any = None        # agent context chain (TradingView -> Binance.US)
     signal_agent: Any = None          # agents.signal_agent.SignalAnalysisAgent
+    option_chain: Any = None          # tools.options_tools.OptionChainProvider
+    options_agent: Any = None         # agents.options_agent.OptionsSelectionAgent
     now_ms: Callable[[], int] = field(default=_now_ms)
     log: Callable[..., None] = field(default=print)
 
@@ -541,3 +543,213 @@ async def run_monitor_cycle(services: Services):
 
     for row in active_signals:
         await monitor_signal(row, services)
+
+    if (
+        config.agent2_enabled()
+        and services.option_chain is not None
+        and services.options_agent is not None
+    ):
+        await run_proposal_sweep(services)
+
+
+#
+# Agent 2 trigger: first transition to WORKING, exactly once.
+#
+
+def _iso_minus_minutes(now_ms, minutes):
+    from datetime import datetime, timezone
+
+    moment = datetime.fromtimestamp(now_ms / 1000 - minutes * 60, timezone.utc)
+    return moment.isoformat(timespec="seconds")
+
+
+async def run_proposal_sweep(services: Services):
+    """
+    For every active WORKING signal with first_working_at set and no
+    trade_proposals row: claim the unique proposal key, run the gates,
+    then Agent 2. Every outcome is persisted; nothing is retried.
+    """
+    from agents.options_agent import proposal_key
+
+    now_ms = services.now_ms()
+
+    for key in database.fail_interrupted_proposals(
+        _iso_minus_minutes(now_ms, config.agent2_pending_timeout_minutes())
+    ):
+        services.log(f"[AGENT2] {key}: interrupted PENDING claim marked FAILED (not retried)")
+
+    for row in database.get_signals_awaiting_proposal():
+        key = proposal_key(row["id"])
+        state = json.loads(row["eval_state"]) if row.get("eval_state") else {}
+
+        #
+        # The confirming candle is persisted once it closes (normally
+        # the next tick). Wait for it rather than guess the time.
+        #
+
+        if state.get("status") != "WORKING" and state.get("confirmation_time") is None:
+            continue
+
+        if not database.claim_proposal(key, row["id"]):
+            continue
+
+        await _propose_for_signal(row, state, key, services, now_ms)
+
+
+async def _propose_for_signal(row, state, key, services: Services, now_ms):
+    from agents.signal_agent import build_input, compute_facts, deterministic_state
+    from schemas import OptionsSelectionInput, SignalAnalysis, ThesisSnapshot
+    from tools.options_tools import (
+        OPTION_TYPE_BY_STRATEGY,
+        STRATEGY_BY_DIRECTION,
+        build_playbook,
+        check_entry_extension,
+        prefilter,
+    )
+
+    log = services.log
+    signal_id = row["id"]
+
+    def finish(status, reason=None, error=None, proposal=None, selection_input=None, trigger=None):
+        database.finish_proposal(
+            key, status, proposal=proposal, selection_input=selection_input,
+            reason=reason, error=error, trigger=trigger
+        )
+        database.record_signal_event(
+            signal_id,
+            f"PROPOSAL_{status}",
+            details={"proposal_key": key, "reason": proposal.reason if proposal else reason, "error": error}
+        )
+        log(f"[AGENT2] Signal #{signal_id}: {status} - {(proposal.reason if proposal else reason) or error}")
+
+    try:
+        #
+        # Gate b: freshness of the WORKING transition.
+        #
+
+        confirmation_ms = state.get("confirmation_time")
+        max_age = config.agent2_max_confirmation_age_minutes()
+
+        if confirmation_ms is None:
+            return finish("SKIPPED", "WORKING without a recorded confirmation time")
+
+        age_minutes = (now_ms - confirmation_ms) / 60_000
+
+        if age_minutes > max_age:
+            return finish(
+                "SKIPPED",
+                f"WORKING detected {age_minutes:.1f} min after confirmation (max {max_age:g}); too late"
+            )
+
+        #
+        # Gate a: Agent 1 analysis must exist and be tradeable.
+        #
+
+        analysis_row = database.get_latest_signal_analysis(signal_id)
+
+        if analysis_row is None and services.signal_agent is not None:
+            await run_signal_analysis(signal_id, services)
+            analysis_row = database.get_latest_signal_analysis(signal_id)
+
+        if analysis_row is None:
+            return finish("SKIPPED", "no Agent 1 analysis available")
+
+        analysis = SignalAnalysis.model_validate_json(analysis_row["output_json"])
+
+        if analysis.signal_state not in ("DEVELOPING", "ALREADY_CONFIRMED"):
+            return finish("SKIPPED", f"Agent 1 state is {analysis.signal_state}")
+
+        #
+        # Gate c: deterministic staleness re-check at the current price.
+        #
+
+        current_price = await asyncio.to_thread(services.market.get_current_price, row["symbol"])
+        recheck_input = build_input(row, current_price=current_price)
+        facts = compute_facts(recheck_input, now_ms)
+        recheck_state, recheck_reasons = deterministic_state(recheck_input, facts)
+
+        if recheck_state not in ("DEVELOPING", "ALREADY_CONFIRMED"):
+            return finish("SKIPPED", f"staleness re-check: {recheck_state}: {'; '.join(recheck_reasons)}")
+
+        #
+        # Gate d: trigger type.
+        #
+
+        trigger = (
+            "FIRST_WORKING" if analysis.signal_state == "DEVELOPING"
+            else "ALREADY_CONFIRMED_FRESH"
+        )
+
+        strategy = STRATEGY_BY_DIRECTION.get(facts.direction)
+
+        if strategy is None or facts.default_target is None:
+            return finish("SKIPPED", "no directional strategy or target", trigger=trigger)
+
+        #
+        # Gate e: stale entry / move-extension (chase protection).
+        # Runs before the chain is fetched, ranked or shown to the LLM.
+        # Entry reference = confirmation level; for immediate-entry
+        # setups (no confirmation level) the price at signal.
+        #
+
+        entry_reference = facts.default_entry_level
+        if entry_reference is None:
+            entry_reference = row.get("price_at_signal")
+
+        allowed, move_pct, extension_reason = check_entry_extension(
+            facts.direction,
+            entry_reference,
+            current_price,
+            config.agent2_max_underlying_move_pct()
+        )
+
+        if not allowed:
+            return finish("SKIPPED", extension_reason, trigger=trigger)
+
+        thesis = ThesisSnapshot(
+            underlying=row["symbol"],
+            direction=facts.direction,
+            entry_level=facts.default_entry_level,
+            target=facts.default_target,
+            invalidation=facts.default_invalidation,
+            time_horizon=analysis.time_horizon,
+            agent1_state=analysis.signal_state
+        )
+
+        #
+        # Chain -> deterministic pre-filter -> Agent 2.
+        #
+
+        playbook = build_playbook()
+
+        chain = await asyncio.to_thread(
+            services.option_chain.get_option_chain,
+            row["symbol"],
+            option_type=OPTION_TYPE_BY_STRATEGY[strategy]
+        )
+
+        candidates, summary = prefilter(chain, thesis, playbook, now_ms)
+
+        selection_input = OptionsSelectionInput(
+            signal_id=signal_id,
+            analysis_id=analysis_row["id"],
+            trigger=trigger,
+            thesis=thesis,
+            underlying_price=chain.underlying_price,
+            as_of_ms=chain.as_of_ms,
+            playbook=playbook,
+            chain_source=chain.source,
+            candidates=candidates,
+            filter_summary=summary
+        )
+
+        proposal = await asyncio.to_thread(services.options_agent.propose, selection_input)
+
+        finish(proposal.status, proposal=proposal, selection_input=selection_input)
+
+        if proposal.status == "PROPOSED":
+            log(proposal.model_dump_json(indent=2, exclude={"filter_summary"}))
+
+    except Exception as error:
+        finish("FAILED", error=f"{type(error).__name__}: {str(error)[:300]}")
+        traceback.print_exc()

@@ -14,7 +14,7 @@ import config
 
 DB_FILE = config.db_path()
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now_iso():
@@ -87,9 +87,14 @@ def initialize_database():
 def migrate(conn):
     version = conn.execute("PRAGMA user_version").fetchone()[0]
 
-    if version >= SCHEMA_VERSION:
-        return
+    if version < 1:
+        _migrate_v1(conn)
 
+    if version < 2:
+        _migrate_v2(conn)
+
+
+def _migrate_v1(conn):
     with conn:
         existing = {
             row[1]
@@ -176,7 +181,51 @@ def migrate(conn):
             """
         )
 
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 1")
+
+
+def _migrate_v2(conn):
+    with conn:
+        #
+        # Agent 2 proposals. proposal_key is UNIQUE: claiming a key
+        # with INSERT OR IGNORE is what makes a proposal exactly-once.
+        #
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_key TEXT NOT NULL UNIQUE,
+                signal_id INTEGER NOT NULL REFERENCES signals(id),
+                status TEXT NOT NULL,
+                trigger TEXT,
+                strategy TEXT,
+                contract_symbol TEXT,
+                option_type TEXT,
+                expiry TEXT,
+                strike REAL,
+                limit_price REAL,
+                quantity INTEGER,
+                contract_multiplier REAL,
+                estimated_max_loss REAL,
+                reason TEXT,
+                error TEXT,
+                input_json TEXT,
+                output_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_proposals_signal
+            ON trade_proposals(signal_id)
+            """
+        )
+
+        conn.execute("PRAGMA user_version = 2")
 
 
 def save_signal(
@@ -413,5 +462,157 @@ def save_signal_analysis(
 def get_signal_analyses(signal_id):
     return _fetch(
         "SELECT * FROM signal_analyses WHERE signal_id = ? ORDER BY id",
+        (signal_id,)
+    )
+
+
+def get_latest_signal_analysis(signal_id):
+    rows = _fetch(
+        "SELECT * FROM signal_analyses WHERE signal_id = ? ORDER BY id DESC LIMIT 1",
+        (signal_id,)
+    )
+    return rows[0] if rows else None
+
+
+#
+# Trade proposals (Agent 2)
+#
+
+def get_signals_awaiting_proposal():
+    """Active WORKING signals that reached WORKING and have no proposal row yet."""
+    return _fetch(
+        """
+        SELECT s.*
+        FROM signals s
+        WHERE s.active = 1
+          AND s.status = 'WORKING'
+          AND s.first_working_at IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM trade_proposals p
+              WHERE p.signal_id = s.id
+          )
+        ORDER BY s.id ASC
+        """
+    )
+
+
+def claim_proposal(proposal_key, signal_id):
+    """
+    Atomically claim the proposal slot. True only for the single
+    caller that inserted the row; every later call gets False.
+    """
+    now = utc_now_iso()
+
+    with closing(get_connection()) as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO trade_proposals (
+                proposal_key, signal_id, status, created_at, updated_at
+            )
+            VALUES (?, ?, 'PENDING', ?, ?)
+            """,
+            (proposal_key, signal_id, now, now)
+        )
+        conn.commit()
+
+    return cursor.rowcount == 1
+
+
+def finish_proposal(
+    proposal_key,
+    status,
+    proposal=None,
+    selection_input=None,
+    reason=None,
+    error=None,
+    trigger=None
+):
+    """Move a PENDING claim to its final status. Never touches non-PENDING rows."""
+    p = proposal
+
+    with closing(get_connection()) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE trade_proposals
+            SET status = ?,
+                trigger = ?,
+                strategy = ?,
+                contract_symbol = ?,
+                option_type = ?,
+                expiry = ?,
+                strike = ?,
+                limit_price = ?,
+                quantity = ?,
+                contract_multiplier = ?,
+                estimated_max_loss = ?,
+                reason = ?,
+                error = ?,
+                input_json = ?,
+                output_json = ?,
+                updated_at = ?
+            WHERE proposal_key = ? AND status = 'PENDING'
+            """,
+            (
+                status,
+                (p.trigger if p else trigger),
+                p.strategy if p else None,
+                p.contract_symbol if p else None,
+                p.option_type if p else None,
+                str(p.expiry) if p and p.expiry else None,
+                p.strike if p else None,
+                p.limit_price if p else None,
+                p.quantity if p else None,
+                p.contract_multiplier if p else None,
+                p.estimated_max_loss if p else None,
+                (p.reason if p else reason),
+                error,
+                selection_input.model_dump_json() if selection_input else None,
+                p.model_dump_json() if p else None,
+                utc_now_iso(),
+                proposal_key
+            )
+        )
+        conn.commit()
+
+    return cursor.rowcount == 1
+
+
+def fail_interrupted_proposals(older_than_iso):
+    """
+    PENDING claims created before older_than_iso were interrupted
+    (crash / restart). Mark FAILED; they are never retried.
+    Returns the affected proposal keys.
+    """
+    with closing(get_connection()) as conn:
+        keys = [
+            row[0] for row in conn.execute(
+                "SELECT proposal_key FROM trade_proposals WHERE status = 'PENDING' AND created_at < ?",
+                (older_than_iso,)
+            )
+        ]
+
+        conn.execute(
+            """
+            UPDATE trade_proposals
+            SET status = 'FAILED',
+                error = 'interrupted: PENDING claim was never completed; not retried',
+                updated_at = ?
+            WHERE status = 'PENDING' AND created_at < ?
+            """,
+            (utc_now_iso(), older_than_iso)
+        )
+        conn.commit()
+
+    return keys
+
+
+def get_proposal(proposal_key):
+    rows = _fetch("SELECT * FROM trade_proposals WHERE proposal_key = ?", (proposal_key,))
+    return rows[0] if rows else None
+
+
+def get_proposals_for_signal(signal_id):
+    return _fetch(
+        "SELECT * FROM trade_proposals WHERE signal_id = ? ORDER BY id",
         (signal_id,)
     )

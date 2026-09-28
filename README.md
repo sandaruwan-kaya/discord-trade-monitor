@@ -31,6 +31,7 @@ venv/bin/python scripts/smoke_telegram.py
 venv/bin/python scripts/smoke_discord.py
 venv/bin/python scripts/live_price_check.py
 venv/bin/python scripts/agent1_demo.py "BTC break above 84,000 targets 85,200, invalid below 82,600"
+venv/bin/python scripts/agent2_demo.py BTCUSDT bullish 85200 82600
 ```
 
 ## Configuration (.env)
@@ -46,3 +47,11 @@ venv/bin/python scripts/agent1_demo.py "BTC break above 84,000 targets 85,200, i
 | `MARKET_PROVIDER_COOLDOWN_SECONDS` | `300` | Skip a failed provider for this long |
 | `MONITOR_CANDLE_PAGE_SIZE` / `MONITOR_MAX_CANDLE_PAGES` | `1000` / `10` | Candle catch-up paging |
 | `TRADE_MONITOR_DB` | project `trade_monitor.db` | DB path override |
+| `AGENT2_ENABLED` | `false` | Create paper option proposals on first WORKING transition |
+| `AGENT2_MAX_CONFIRMATION_AGE_MINUTES` | `15` | WORKING detected later than this after confirmation: no proposal |
+| `AGENT2_MAX_UNDERLYING_MOVE_PCT` | `0.5` | Chase protection: price already beyond entry by more than this % in the trade direction → SKIPPED (`stale_entry_move_extended`); exactly equal is allowed |
+| `AGENT2_MAX_LLM_CANDIDATES` | `8` | Pre-filtered candidates shown to Agent 2 |
+| `AGENT2_PENDING_TIMEOUT_MINUTES` | `10` | Interrupted PENDING claims become FAILED (never retried) |
+| `ALLOWED_UNDERLYINGS` | `BTCUSDT,ETHUSDT` | Underlyings eligible for option proposals |
+| `MAX_PREMIUM_PER_TRADE`, `MAX_CONTRACTS`, `MIN_DTE`, `MAX_DTE`, `MIN_ABS_DELTA`, `MAX_ABS_DELTA`, `MAX_BID_ASK_SPREAD_PCT`, `MIN_OPEN_INTEREST`, `MIN_OPTION_VOLUME`, `MAX_QUOTE_AGE_SECONDS`, `OPTION_FEE_PER_CONTRACT` | `500, 2, 7, 45, 0.35, 0.65, 10, 100, 10, 60, 0` | Paper-trading demo playbook limits |
+| `MOCK_OPTION_{MULTIPLIER,STRIKE_STEP,TICK,BASE_IV,PEAK_OI}_{BTC,ETH}` | BTC `0.01/1000/5/0.50/3000`, ETH `0.1/25/0.5/0.65/5000` | Mock Deribit-style chain |

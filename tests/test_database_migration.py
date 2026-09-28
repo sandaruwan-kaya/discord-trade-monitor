@@ -61,7 +61,7 @@ def test_migrates_legacy_db_preserving_rows(tmp_path, monkeypatch):
 
     cols, tables, version = columns(path)
     assert set(database.SIGNAL_COLUMNS_V1) <= cols
-    assert {"signal_events", "signal_analyses"} <= tables
+    assert {"signal_events", "signal_analyses", "trade_proposals"} <= tables
     assert version == database.SCHEMA_VERSION
 
     rows = database.get_active_signals()

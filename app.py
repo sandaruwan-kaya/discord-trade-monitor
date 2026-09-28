@@ -9,13 +9,16 @@ from llm_parser import parse_discord_message
 from telegram_client import send_telegram
 
 import config
+import database
 from database import initialize_database
 from llm_client import OpenAILLMClient
+from agents.options_agent import OptionsSelectionAgent
 from agents.signal_agent import SignalAnalysisAgent
 from tools.market_tools import (
     BinanceUSProvider,
     build_market_context_provider
 )
+from tools.options_tools import MockDeribitChainProvider
 from signal_service import (
     Services,
     database_row_to_signal,  # noqa: F401  (kept importable from app)
@@ -57,12 +60,18 @@ client = discord.Client(
 # falls back to Binance.US.
 #
 
+binance_us = BinanceUSProvider()
+
 services = Services(
     parse_message=parse_discord_message,
-    market=BinanceUSProvider(),
+    market=binance_us,
     notify=send_telegram,
     context_market=build_market_context_provider(),
-    signal_agent=SignalAnalysisAgent(OpenAILLMClient())
+    signal_agent=SignalAnalysisAgent(OpenAILLMClient()),
+    # V1: mock Deribit-style chain priced off the same Binance.US feed
+    # the evaluator uses. Proposals only; no broker is wired.
+    option_chain=MockDeribitChainProvider(binance_us),
+    options_agent=OptionsSelectionAgent(OpenAILLMClient())
 )
 
 
@@ -131,6 +140,11 @@ async def on_ready():
     print(
         f"Agent 1: "
         f"{'ENABLED' if config.agent1_enabled() else 'disabled'}"
+    )
+
+    print(
+        f"Agent 2 (paper proposals only): "
+        f"{'ENABLED' if config.agent2_enabled() else 'disabled'}"
     )
 
     print("=" * 60)
@@ -214,6 +228,16 @@ async def main():
     #
 
     initialize_database()
+
+    #
+    # Single process: any PENDING proposal claim left over from a
+    # previous run was interrupted. Mark FAILED, never retry.
+    #
+
+    for key in database.fail_interrupted_proposals(
+        database.utc_now_iso()
+    ):
+        print(f"[AGENT2] {key}: interrupted at last shutdown, marked FAILED")
 
     #
     # Start background monitor.
